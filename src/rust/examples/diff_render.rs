@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use claude_image_proxy::font::AtlasFont;
-use claude_image_proxy::render::render_chunks;
+use pixelpipe::font::AtlasFont;
+use pixelpipe::render::render_chunks;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);

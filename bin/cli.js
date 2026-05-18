@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * claude-image-proxy CLI
+ * pixelpipe CLI
  *
  * Usage:
- *   npx claude-image-proxy                  # start on default port 47821
- *   npx claude-image-proxy --port 9000      # custom port
- *   npx claude-image-proxy --no-compress    # disable compression (passthrough)
+ *   npx pixelpipe                  # start on default port 47821
+ *   npx pixelpipe --port 9000      # custom port
+ *   npx pixelpipe --no-compress    # disable compression (passthrough)
  *
  * Then point Claude Code at it:
  *   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -53,13 +53,13 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`claude-image-proxy — token-saving proxy for Claude Code
+  console.log(`pixelpipe — token-saving proxy for Claude Code
 
 Renders system prompt + tool definitions as bitmap images. Achieves 65-73%
 token savings on Opus 4.7 with 100% reasoning quality preserved.
 
 USAGE
-  npx claude-image-proxy [options]
+  npx pixelpipe [options]
 
 OPTIONS
   -p, --port <N>          Port to listen on (default: 47821)
@@ -74,7 +74,7 @@ OPTIONS
 
 USAGE WITH CLAUDE CODE
   Terminal 1:
-    npx claude-image-proxy
+    npx pixelpipe
 
   Terminal 2:
     ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude --exclude-dynamic-system-prompt-sections
@@ -145,7 +145,7 @@ function main() {
     MIN_COMPRESS_CHARS: String(opts.minChars),
   };
 
-  console.log(`claude-image-proxy v${readPkgVersion()} starting...`);
+  console.log(`pixelpipe v${readPkgVersion()} starting...`);
   console.log(`  python:        ${py}`);
   console.log(`  port:          ${opts.port}`);
   console.log(`  compression:   ${opts.compress ? "ON" : "OFF (passthrough)"}`);

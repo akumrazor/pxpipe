@@ -26,7 +26,7 @@ function hasModule(py, mod) {
 
 const py = findPython();
 if (!py) {
-  console.warn("\n[claude-image-proxy] WARNING: Python 3.8+ not found.");
+  console.warn("\n[pixelpipe] WARNING: Python 3.8+ not found.");
   console.warn("  Install Python 3 (https://www.python.org/downloads/) then run:");
   console.warn("    python3 -m pip install Pillow httpx");
   console.warn("  Otherwise the proxy will fail to start.\n");
@@ -37,14 +37,14 @@ const need = [];
 if (!hasModule(py, "PIL")) need.push("Pillow");
 if (!hasModule(py, "httpx")) need.push("httpx");
 if (need.length === 0) {
-  console.log("[claude-image-proxy] Python deps already installed.");
+  console.log("[pixelpipe] Python deps already installed.");
   process.exit(0);
 }
 
-console.log(`[claude-image-proxy] Installing Python deps: ${need.join(", ")}`);
+console.log(`[pixelpipe] Installing Python deps: ${need.join(", ")}`);
 const args = ["-m", "pip", "install", "--quiet", "--user", ...need];
 const r = spawnSync(py, args, { stdio: "inherit" });
 if (r.status !== 0) {
-  console.warn("\n[claude-image-proxy] WARNING: failed to auto-install Python deps.");
+  console.warn("\n[pixelpipe] WARNING: failed to auto-install Python deps.");
   console.warn(`  Please run manually:  ${py} -m pip install ${need.join(" ")}`);
 }

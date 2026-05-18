@@ -1,9 +1,9 @@
 {
-  "name": "claude-image-proxy",
+  "name": "pixelpipe",
   "version": "0.1.0",
   "description": "Token-saving proxy for Claude Code: renders system prompt + tool definitions as images, achieving 65-73% token savings on Opus 4.7 while preserving 100% reasoning quality.",
   "bin": {
-    "claude-image-proxy": "bin/cli.js"
+    "pixelpipe": "bin/cli.js"
   },
   "scripts": {
     "postinstall": "node scripts/install.js",

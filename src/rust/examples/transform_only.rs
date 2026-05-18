@@ -13,8 +13,8 @@
 
 use std::path::PathBuf;
 
-use claude_image_proxy::font::AtlasFont;
-use claude_image_proxy::transform::{transform, TransformConfig};
+use pixelpipe::font::AtlasFont;
+use pixelpipe::transform::{transform, TransformConfig};
 use dashmap::DashMap;
 
 fn main() -> anyhow::Result<()> {

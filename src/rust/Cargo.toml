@@ -1,13 +1,13 @@
 [package]
-name = "claude-image-proxy"
+name = "pixelpipe"
 version = "0.1.0"
 edition = "2021"
 description = "Token-saving proxy for Claude Code that renders system prompt + tools as images"
 license = "MIT"
-repository = "https://github.com/your/claude-image-proxy"
+repository = "https://github.com/your/pixelpipe"
 
 [[bin]]
-name = "claude-image-proxy"
+name = "pixelpipe"
 path = "src/main.rs"
 
 [dependencies]
@@ -67,5 +67,5 @@ inherits = "release"
 opt-level = "z"
 
 [lib]
-name = "claude_image_proxy"
+name = "pixelpipe"
 path = "src/lib.rs"

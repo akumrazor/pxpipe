@@ -1,8 +1,8 @@
 //! Render a sample text → PNG so we can visually inspect + OCR-test.
 //! Run: cargo run --example render_sample -- <output.png> [size]
 
-use claude_image_proxy::font::AtlasFont;
-use claude_image_proxy::render::render_chunks;
+use pixelpipe::font::AtlasFont;
+use pixelpipe::render::render_chunks;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);

@@ -1,4 +1,4 @@
-//! claude-image-proxy — token-saving proxy for Claude Code.
+//! pixelpipe — token-saving proxy for Claude Code.
 //!
 //! Architecture mirrors the proven Python prototype:
 //!   1. Accept HTTP from Claude Code on a local port.
@@ -20,7 +20,7 @@ mod render;
 mod font;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "claude-image-proxy", version, about, long_about = None)]
+#[command(name = "pixelpipe", version, about, long_about = None)]
 struct Args {
     /// Port to listen on
     #[arg(short, long, default_value_t = 47821)]
@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("claude_image_proxy=info,info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("pixelpipe=info,info")),
         )
         .with_target(false)
         .init();
@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
         font: Arc::new(font::AtlasFont::load(font_size)?),
     };
 
-    println!("claude-image-proxy v{} starting", env!("CARGO_PKG_VERSION"));
+    println!("pixelpipe v{} starting", env!("CARGO_PKG_VERSION"));
     println!("  port:          {}", port);
     println!("  compression:   {}", if compress { "ON" } else { "OFF (passthrough)" });
     if compress {

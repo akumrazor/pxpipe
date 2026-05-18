@@ -430,11 +430,11 @@ def transform_request(body: bytes) -> tuple[bytes, dict]:
 
 
 # Running session totals so users can see live savings.
-# Persisted to ~/.cache/claude-image-proxy/stats.json on every update so
+# Persisted to ~/.cache/pixelpipe/stats.json on every update so
 # restarts don't wipe history. Recent feed + latest PNG stay in-memory only.
 import threading, time, collections, pathlib
 
-_STATS_DIR = pathlib.Path.home() / ".cache" / "claude-image-proxy"
+_STATS_DIR = pathlib.Path.home() / ".cache" / "pixelpipe"
 _STATS_FILE = _STATS_DIR / "stats.json"     # cumulative totals (rewritten atomically)
 _REQUESTS_FILE = _STATS_DIR / "requests.jsonl"  # full per-request log (append-only)
 _REQUESTS_ROTATE_BYTES = 10 * 1024 * 1024  # rotate at 10 MB
@@ -534,7 +534,7 @@ DASHBOARD_HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>claude-image-proxy — live dashboard</title>
+<title>pixelpipe — live dashboard</title>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; padding: 24px; background: #0d1117; color: #c9d1d9;
@@ -574,7 +574,7 @@ DASHBOARD_HTML = """<!doctype html>
 </style>
 </head>
 <body>
-<h1><span class="dot"></span>claude-image-proxy</h1>
+<h1><span class="dot"></span>pixelpipe</h1>
 <div class="sub" id="sub">connecting...</div>
 
 <div class="grid">

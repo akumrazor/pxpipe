@@ -1,4 +1,4 @@
-# claude-image-proxy
+# pixelpipe
 
 A token-saving proxy for Claude Code that renders the system prompt + tool
 definitions + tool schemas as **bitmap images** instead of sending them as text.
@@ -13,7 +13,7 @@ model gets the same context — but rendered as ~3,500 image tokens instead of
 
 ```bash
 # Terminal 1
-npx claude-image-proxy
+npx pixelpipe
 
 # Terminal 2
 ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude --exclude-dynamic-system-prompt-sections
@@ -64,7 +64,7 @@ cache_read), saving ~70% of input cost per turn forever.
 ## Architecture
 
 ```
-~/Downloads/repos/claude-image-proxy/
+~/Downloads/repos/pixelpipe/
 ├── bin/cli.js          # npx entry point
 ├── scripts/
 │   ├── install.js      # postinstall: verify Python + install Pillow/httpx
@@ -128,7 +128,7 @@ Then `claude -p "Read out.png and transcribe"` to verify OCR.
 ## Configuration
 
 ```
-npx claude-image-proxy [options]
+npx pixelpipe [options]
 
   -p, --port <N>          Port to listen on (default: 47821)
   --no-compress           Disable all compression (pure passthrough)

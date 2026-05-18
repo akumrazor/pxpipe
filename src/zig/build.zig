@@ -1,4 +1,4 @@
-//! Zig 0.16 build for claude-image-proxy.
+//! Zig 0.16 build for pixelpipe.
 //!
 //! Targets:
 //!   zig build              # build all
