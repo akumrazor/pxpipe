@@ -33,6 +33,11 @@ interface CliOpts {
   compressSchemas: boolean;
   compressReminders: boolean;
   compressToolResults: boolean;
+  /** Variant C history-image compression (opt-in). Marginal savings per
+   *  round-3 spec; only enable once cache topology is verified. */
+  compressHistory: boolean;
+  historyKeepTail: number;
+  historyMinPrefix: number;
   minCompressChars: number;
   minReminderChars: number;
   minToolResultChars: number;
@@ -59,6 +64,13 @@ function parseCli(argv: string[]): CliOpts {
     compressSchemas: envFlag('COMPRESS_SCHEMAS', true),
     compressReminders: envFlag('COMPRESS_REMINDERS', true),
     compressToolResults: envFlag('COMPRESS_TOOL_RESULTS', true),
+    // Variant C history-image: OFF by default. Round-3 spec marks the
+    // savings as MARGINAL (~1% per-call) against HIGH cache-topology risk.
+    // Flip via COMPRESS_HISTORY=1 or --history once telemetry shows the
+    // static-slab cache_control still hits.
+    compressHistory: envFlag('COMPRESS_HISTORY', false),
+    historyKeepTail: Number(process.env.HISTORY_KEEP_TAIL ?? 4),
+    historyMinPrefix: Number(process.env.HISTORY_MIN_PREFIX ?? 10),
     minCompressChars: Number(process.env.MIN_COMPRESS_CHARS ?? 2000),
     // Raised to 10,000 — the per-block break-even point at the current
     // renderer config (Unifont 10px, cell 5×11, 100 cols). The real gate
@@ -85,6 +97,10 @@ function parseCli(argv: string[]): CliOpts {
       case '--no-schemas':     o.compressSchemas = false; break;
       case '--no-reminders':   o.compressReminders = false; break;
       case '--no-tool-results':o.compressToolResults = false; break;
+      case '--history':        o.compressHistory = true; break;
+      case '--no-history':     o.compressHistory = false; break;
+      case '--history-keep-tail': o.historyKeepTail = Number(eat()); break;
+      case '--history-min-prefix': o.historyMinPrefix = Number(eat()); break;
       case '--min-chars':      o.minCompressChars = Number(eat()); break;
       case '--min-reminder-chars': o.minReminderChars = Number(eat()); break;
       case '--min-tool-result-chars': o.minToolResultChars = Number(eat()); break;
@@ -464,6 +480,9 @@ async function main(): Promise<void> {
     compressSchemas: opts.compressSchemas,
     compressReminders: opts.compressReminders,
     compressToolResults: opts.compressToolResults,
+    compressHistory: opts.compressHistory,
+    historyKeepTail: opts.historyKeepTail,
+    historyMinPrefix: opts.historyMinPrefix,
     minCompressChars: opts.minCompressChars,
     minReminderChars: opts.minReminderChars,
     minToolResultChars: opts.minToolResultChars,
@@ -584,7 +603,7 @@ async function main(): Promise<void> {
   server.listen(opts.port, () => {
     console.log(`[pixelpipe] listening on http://127.0.0.1:${opts.port} → ${opts.upstream}`);
     console.log(
-      `[pixelpipe] config: compress=${opts.compress} tools=${opts.compressTools} schemas=${opts.compressSchemas} reminders=${opts.compressReminders} tool_results=${opts.compressToolResults} min=${opts.minCompressChars} placement=${opts.placement} cols=${opts.cols}`,
+      `[pixelpipe] config: compress=${opts.compress} tools=${opts.compressTools} schemas=${opts.compressSchemas} reminders=${opts.compressReminders} tool_results=${opts.compressToolResults} history=${opts.compressHistory} min=${opts.minCompressChars} placement=${opts.placement} cols=${opts.cols}`,
     );
     if (opts.track) console.log(`[pixelpipe] tracking events → ${opts.eventsFile}`);
     else console.log('[pixelpipe] tracking disabled (--no-track or PIXELPIPE_TRACK=0)');

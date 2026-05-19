@@ -44,6 +44,18 @@ export interface TrackEvent {
   truncated_tool_results?: number;
   /** Total chars elided by paging across all tool_results this request. */
   omitted_chars?: number;
+  /** Variant C history-image: how many messages got collapsed into the
+   *  prepended synthetic user message this request. Absent when not. */
+  collapsed_turns?: number;
+  /** Variant C: total chars of text serialized into the history image(s)
+   *  before render. Absent when no collapse happened. */
+  collapsed_chars?: number;
+  /** Variant C: number of PNG image blocks emitted for the history. Folded
+   *  into `image_count` too — surfaced separately so dashboards can
+   *  attribute image-count growth to history vs system-slab vs reminders. */
+  collapsed_images?: number;
+  /** Variant C: why the history collapse didn't run (or did). Diagnostic. */
+  history_reason?: string;
   /** Codepoints rendered into images that weren't in the glyph atlas. A
    *  spike here means users are typing glyphs we don't ship — consider
    *  switching ATLAS_PROFILE to `full-bmp`. */
@@ -160,6 +172,18 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.omittedChars !== undefined && info.omittedChars > 0) {
       out.omitted_chars = info.omittedChars;
+    }
+    if (info.collapsedTurns !== undefined && info.collapsedTurns > 0) {
+      out.collapsed_turns = info.collapsedTurns;
+    }
+    if (info.collapsedChars !== undefined && info.collapsedChars > 0) {
+      out.collapsed_chars = info.collapsedChars;
+    }
+    if (info.collapsedImages !== undefined && info.collapsedImages > 0) {
+      out.collapsed_images = info.collapsedImages;
+    }
+    if (info.historyReason !== undefined) {
+      out.history_reason = info.historyReason;
     }
     if (info.droppedChars !== undefined && info.droppedChars > 0) {
       out.dropped_chars = info.droppedChars;
