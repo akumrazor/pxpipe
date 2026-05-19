@@ -27,9 +27,11 @@ Claude Code  ──►  pixelpipe  ──►  │  (system + tools as text)     
 
 The proxy intercepts `POST /v1/messages`, pulls the system prompt + tool
 documentation out of the JSON body, renders it into one or more grayscale
-PNGs using a build-time-generated JetBrains Mono glyph atlas, and
-substitutes those PNGs back in as `image` content blocks with an
-`ephemeral` cache_control breakpoint.
+PNGs using a build-time-generated GNU Unifont glyph atlas (covers ~35k
+BMP codepoints by default — Latin, Cyrillic, Greek, CJK, Hiragana,
+Katakana, Hangul, Hebrew, Arabic, math symbols, box drawing, decorative
+symbols), and substitutes those PNGs back in as `image` content blocks
+with an `ephemeral` cache_control breakpoint.
 
 Token math (Opus 4.7, real Claude Code workflow):
 
@@ -49,6 +51,28 @@ npm install
 npm run build           # produces dist/node.js
 node bin/cli.js         # listens on 127.0.0.1:47821 by default
 ```
+
+After editing code, restart in one step:
+
+```bash
+pnpm run restart                              # graceful SIGTERM of any running
+                                               # instance → rebuild → fresh start
+pnpm run restart -- --no-build                # skip rebuild (dist/ is fresh)
+pnpm run restart -- --port 47822 --no-tools   # forward CLI flags to the proxy
+```
+
+`pnpm run restart` does, in order:
+
+1. Lists every running pixelpipe PID (via `pgrep`) and SIGTERMs them all.
+   Orphans from prior crashed sessions are cleaned up too.
+2. Waits up to 5s for graceful exit (the SIGTERM handler flushes the JSONL
+   tracker). Escalates to SIGKILL only if anything's still alive.
+3. Runs `pnpm run build`. Build failures abort the restart — the script
+   refuses to start a stale binary. Pass `--no-build` to skip when you
+   know `dist/` is fresh.
+4. Checks the target port is free. If it isn't, names the holding process
+   and refuses to start (cheaper than a crashed Node stacktrace).
+5. `exec`s `node bin/cli.js "$@"` in the foreground so Ctrl-C reaches Node.
 
 Point Claude Code at it:
 
@@ -114,7 +138,7 @@ If unset, the proxy forwards whatever `x-api-key` the client sent.
 ```
 src/
 ├── core/              100% runtime-agnostic (Web Standard APIs only)
-│   ├── atlas.ts         (generated) base64-inlined glyph bitmap
+│   ├── atlas.ts         (generated) sparse Unicode atlas, base64-inlined
 │   ├── png.ts           minimal grayscale PNG encoder
 │   ├── render.ts        text → PNG bytes
 │   ├── transform.ts     request body rewriter
@@ -124,31 +148,46 @@ src/
 └── worker.ts          export default { fetch }
 
 scripts/
-├── gen-atlas.ts       build-time: TTF → atlas.ts (uses @napi-rs/canvas)
+├── gen-atlas.ts       build-time: OTF → atlas.ts (uses @napi-rs/canvas)
 └── build.mjs          esbuild bundler for Node target
 
 assets/
-└── JetBrainsMono-Regular.ttf
+├── Unifont-16.0.04.otf       primary font (~35k BMP codepoints w/ full-bmp profile)
+├── UNIFONT_LICENSE.txt       OFL + GPL-with-font-exception
+└── JetBrainsMono-Regular.ttf legacy / ASCII-only fallback (kept on disk)
 ```
 
-The atlas is generated **at build time**, base64-inlined into a `.ts`
-file, and shipped with the bundle. At runtime there are zero external
-files to read and zero non-Web-Standard imports — that's the only way
-this works in Workers without per-request asset fetches.
+The atlas is generated **at build time** from `Unifont-16.0.04.otf`,
+base64-inlined into a `.ts` file with sparse codepoint + offset tables
+(binary-packed), and shipped with the bundle. At runtime there are zero
+external files to read and zero non-Web-Standard imports — that's the
+only way this works in Workers without per-request asset fetches.
 
-Regenerate the atlas (e.g., after swapping the font or font size):
+Regenerate the atlas (after swapping fonts, sizes, or codepoint profile):
 
 ```bash
-FONT_PX=15 npm run build:atlas
+pnpm run build:atlas                          # default: full-bmp (~35k cp, all BMP Unifont covers)
+ATLAS_PROFILE=practical pnpm run build:atlas  # drops Hangul (~24k cp; for Workers free-tier)
+FONT_PX=12 pnpm run build:atlas               # nondefault size; verify cells
 ```
 
 ---
 
 ## Limitations
 
-- Sub-9pt full OCR. Menlo (Python proxy default) is in the verified
-  floor; the bundled JetBrains Mono at 15px is comparable. Smaller sizes
-  cause OCR errors.
+- The bundled GNU Unifont at 10px (cell 5×11 px Latin, 10×11 CJK) is
+  Anthropic-OCR-clean for ~35k BMP codepoints by default (`full-bmp`
+  profile): Latin, Cyrillic, Greek, CJK Unified Ideographs, Hiragana,
+  Katakana, Hangul, Hebrew, Arabic, math symbols, box-drawing, arrows,
+  Dingbats, Letterlike Symbols, Enclosed Alphanumerics, etc. Drops for
+  codepoints outside the profile (e.g. emoji 😀 — supplementary plane)
+  get counted in `events.jsonl#dropped_chars` (with the top-20 broken
+  out as `dropped_codepoints_top`) so you can spot patterns. For
+  Workers free-tier deployments under the 1 MB compressed-bundle cap,
+  switch to `ATLAS_PROFILE=practical pnpm run build:atlas` (~24k cp;
+  drops Hangul). Right-to-left scripts render left-to-right in source
+  order (no bidi shaping); Devanagari / Thai / similar
+  complex shaping is also unsupported.
 - Compression sets a 5-minute prompt-cache TTL. Adding `cache_control:
   ephemeral` causes warm-cache rotation, not eviction.
 - A 5KB break-even point: if input is `< MIN_COMPRESS_CHARS` chars we
@@ -170,7 +209,7 @@ npm run dev:worker            # wrangler dev
 npm run test                  # vitest
 npm run test:watch
 npm run typecheck             # tsc --noEmit
-npm run build:atlas           # regenerate src/core/atlas.ts from TTF
+pnpm run build:atlas          # regenerate src/core/atlas.ts from OTF
 npm run build                 # build dist/node.js
 npm run deploy:worker         # wrangler deploy
 ```

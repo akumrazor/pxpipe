@@ -108,3 +108,65 @@ describe('noopTracker', () => {
     ).not.toThrow();
   });
 });
+
+describe('toTrackEvent body-sample mapping', () => {
+  const baseEv = {
+    method: 'POST',
+    path: '/v1/messages',
+    status: 400,
+    durationMs: 100,
+  };
+
+  it('inlines small gzipped bodies as req_body_sample_b64', () => {
+    const small = new Uint8Array(64).fill(0x1f);
+    const out = toTrackEvent({
+      ...baseEv,
+      reqBodySha8: 'deadbeef',
+      reqBodyGz: small,
+    } as ProxyEvent);
+    expect(out.req_body_sha8).toBe('deadbeef');
+    expect(out.req_body_sample_b64).toBeDefined();
+    expect(out.req_body_sample_b64!.length).toBeLessThanOrEqual(128);
+    expect(out.req_body_sample_path).toBeUndefined();
+  });
+
+  it('drops oversized gzipped bodies that lack a sidecar path', () => {
+    // 40 KiB of gz bytes → ~53 KiB base64 → exceeds the 32 KiB cap, and we
+    // didn't pre-write a sidecar → must silently drop the inline body
+    // (Workers path). req_body_sha8 still lands.
+    const big = new Uint8Array(40 * 1024).fill(0x42);
+    const out = toTrackEvent({
+      ...baseEv,
+      reqBodySha8: 'cafef00d',
+      reqBodyGz: big,
+    } as ProxyEvent);
+    expect(out.req_body_sha8).toBe('cafef00d');
+    expect(out.req_body_sample_b64).toBeUndefined();
+    expect(out.req_body_sample_path).toBeUndefined();
+  });
+
+  it('prefers reqBodySamplePath over inlining when both are set', () => {
+    const someGz = new Uint8Array(64).fill(0x1f);
+    const out = toTrackEvent({
+      ...baseEv,
+      reqBodySha8: 'feedface',
+      reqBodyGz: someGz,
+      reqBodySamplePath: '/tmp/4xx-bodies/x.json.gz',
+    } as ProxyEvent);
+    // Sidecar path wins; we don't double-encode inline.
+    expect(out.req_body_sample_path).toBe('/tmp/4xx-bodies/x.json.gz');
+    expect(out.req_body_sample_b64).toBeUndefined();
+  });
+
+  it('sets req_body_sha8 on 2xx events too (correlation across statuses)', () => {
+    const out = toTrackEvent({
+      ...baseEv,
+      status: 200,
+      reqBodySha8: '01234567',
+    } as ProxyEvent);
+    expect(out.req_body_sha8).toBe('01234567');
+    // No body sample fields for 2xx.
+    expect(out.req_body_sample_b64).toBeUndefined();
+    expect(out.req_body_sample_path).toBeUndefined();
+  });
+});

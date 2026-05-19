@@ -47,8 +47,11 @@ export default {
       compressReminders: truthy(env.COMPRESS_REMINDERS, true),
       compressToolResults: truthy(env.COMPRESS_TOOL_RESULTS, true),
       minCompressChars: env.MIN_COMPRESS_CHARS ? Number(env.MIN_COMPRESS_CHARS) : 2000,
-      minReminderChars: env.MIN_REMINDER_CHARS ? Number(env.MIN_REMINDER_CHARS) : 1000,
-      minToolResultChars: env.MIN_TOOL_RESULT_CHARS ? Number(env.MIN_TOOL_RESULT_CHARS) : 2000,
+      // Raised from 1000/2000 per history-researcher's measurement: real
+      // per-image cost is ~2,500 tokens; small blocks cost more as images
+      // than text. Keep in sync with DEFAULTS in src/core/transform.ts.
+      minReminderChars: env.MIN_REMINDER_CHARS ? Number(env.MIN_REMINDER_CHARS) : 2000,
+      minToolResultChars: env.MIN_TOOL_RESULT_CHARS ? Number(env.MIN_TOOL_RESULT_CHARS) : 5000,
       placement: (env.PLACEMENT as 'system' | 'user') ?? 'user',
       cols: env.COLS ? Number(env.COLS) : 100,
     };

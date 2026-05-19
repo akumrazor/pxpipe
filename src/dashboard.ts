@@ -56,15 +56,24 @@ interface Totals {
   startedAt: number;
 }
 
-/** Per-pixel cost in tokens. Anthropic charges (W*H)/750 for image blocks.
- *  For grayscale PNG of text, the encoded byte count is roughly 50% of the
- *  raw pixel count (zlib on dense glyph data), so:
- *     raw_pixels ≈ png_bytes × 2
- *     token_est  ≈ raw_pixels / 750  ≈ png_bytes / 375
- *  This tracks ACTUAL rendered size per request instead of assuming every
- *  image is the worst-case 1466×1568. */
-function estImageTokens(pngBytes: number): number {
-  return Math.floor(pngBytes / 375);
+/** Empirical per-image token cost (Opus 4.x at our typical 808×1568 render).
+ *  history-researcher's round-3 measurement on N=33 cold-miss events from
+ *  events.jsonl (2026-05-18) found the real billable cost averages
+ *  ~2,300–2,750 tokens per image; we use 2,500 as the working constant.
+ *
+ *  The documented theoretical max (Anthropic's published `(w*h)/750`
+ *  formula) gives ~1,690 tokens for our render shape and underpredicts
+ *  what we actually get billed. The prior implementation here was even
+ *  more optimistic — `pngBytes / 375` came out to ~190 tokens, off by
+ *  ~12×. That bug made the dashboard's "saved" column wildly overstate
+ *  the actual cost reduction.
+ *
+ *  See /tmp/pixelpipe-history-compression.md for the analysis. */
+const OPUS_IMAGE_TOKEN_COST = 2500;
+
+/** Estimated token cost of the N images we emit per compressed request. */
+function estImageTokens(imageCount: number): number {
+  return imageCount * OPUS_IMAGE_TOKEN_COST;
 }
 
 /** Compute the weighted "effective" input cost of a single upstream call.
@@ -84,23 +93,21 @@ function effectiveCost(
  *  cache mix the actual call paid — otherwise cold-cache turns get scored as
  *  if the baseline were warm-cache and savings look tiny.
  *
- *  Uses `imageBytes` (actual PNG byte count) to estimate image tokens rather
- *  than `imageCount × 3066`. The old constant assumed every image was the
- *  worst-case 1466×1568 (Anthropic's max). Reality: our renderer's width is
- *  fixed at 2*PAD_X + DEFAULT_COLS*ATLAS_CELL_W = 908px, so even a full-height
- *  image is only 908×1568/750 ≈ 1898 tokens — and a typical image at this
- *  workload is closer to 908×~140px (~170 tokens). Worst-case overestimated
- *  by ~15×, the `extraText` clamp collapsed to 0, and real savings hid.
+ *  Uses `imageCount × OPUS_IMAGE_TOKEN_COST` (=2500/image, empirical from
+ *  N=33 cold-miss events 2026-05-18) to estimate image tokens. Prior
+ *  implementation used `pngBytes / 375` ≈ 190 tokens/image — wrong by
+ *  ~12×, which made the "saved" column wildly overstate cost reduction.
+ *  See estImageTokens() above for the analysis link.
  */
 function baselineCost(
   actualEff: number,
   origChars: number,
-  imageBytes: number,
+  imageCount: number,
   cacheCreate: number,
   cacheRead: number,
 ): number {
   const txtReplaced = Math.floor(origChars / 4); // ~4 chars per token in English
-  const imgTokensEst = estImageTokens(imageBytes);
+  const imgTokensEst = estImageTokens(imageCount);
   const extraText = Math.max(0, txtReplaced - imgTokensEst);
   const cachedTotal = cacheCreate + cacheRead;
   const baselineRate =
@@ -155,7 +162,7 @@ export class DashboardState {
     const eff = haveUsage ? effectiveCost(inp, cc, cr) : 0;
     const baselineEff =
       haveUsage && compressed
-        ? baselineCost(eff, info?.origChars ?? 0, info?.imageBytes ?? 0, cc, cr)
+        ? baselineCost(eff, info?.origChars ?? 0, info?.imageCount ?? 0, cc, cr)
         : eff;
 
     const prevSaved = this.totals.effectiveInputBaselineEst - this.totals.effectiveInputActual;
@@ -172,7 +179,7 @@ export class DashboardState {
       status: ev.status,
       compressed,
       cc_added: compressed ? 1 : undefined, // we always emit exactly one cache_control
-      expected_image_tokens: compressed ? estImageTokens(info?.imageBytes ?? 0) : undefined,
+      expected_image_tokens: compressed ? estImageTokens(info?.imageCount ?? 0) : undefined,
       input_tokens: haveUsage ? inp : undefined,
       cache_create: haveUsage ? cc : undefined,
       cache_read: haveUsage ? cr : undefined,
@@ -216,7 +223,7 @@ export class DashboardState {
         compressed: t.compressed === true,
         cc_added: t.compressed === true ? 1 : undefined,
         expected_image_tokens:
-          t.compressed === true ? estImageTokens(t.image_bytes ?? 0) : undefined,
+          t.compressed === true ? estImageTokens(t.image_count ?? 0) : undefined,
         input_tokens: t.input_tokens,
         cache_create: t.cache_create_tokens,
         cache_read: t.cache_read_tokens,

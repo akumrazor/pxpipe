@@ -13,6 +13,7 @@
  */
 
 import type { ProxyEvent } from './proxy.js';
+import { bytesToBase64 } from './png.js';
 
 /** The flat record shape that lands in JSONL / log lines. Adding a field
  *  here is a non-breaking change for readers. */
@@ -38,6 +39,15 @@ export interface TrackEvent {
   reminder_imgs?: number;
   /** Image count attributable to compressing tool_result content. */
   tool_result_imgs?: number;
+  /** Codepoints rendered into images that weren't in the glyph atlas. A
+   *  spike here means users are typing glyphs we don't ship — consider
+   *  switching ATLAS_PROFILE to `full-bmp`. */
+  dropped_chars?: number;
+  /** Top-20 dropped codepoints by frequency for this request, keyed
+   *  `U+HHHH`. Only present when `dropped_chars > 0`. Lets the operator
+   *  identify which Unicode blocks to add to the atlas profile without
+   *  having to capture & inspect the request body. */
+  dropped_codepoints_top?: Record<string, number>;
   /** Tag names found in the static slab we don't recognize. Canary for
    *  Claude Code releases that add new dynamic tags. */
   unknown_static_tags?: string[];
@@ -63,7 +73,29 @@ export interface TrackEvent {
 
   // Errors:
   error?: string;
+  /** First ~2 KiB of the upstream response body for 4xx requests. Lets us
+   *  see what Anthropic actually rejected without re-running the request. */
+  error_body?: string;
+  /** sha256[0..8] of the TRANSFORMED outgoing request body. Set on every
+   *  /v1/messages POST. Lets future debuggers correlate identical payloads
+   *  across requests without persisting bodies. */
+  req_body_sha8?: string;
+  /** Gzipped+base64'd TRANSFORMED outgoing request body for 4xx requests,
+   *  when it fits inline (≤ TRACK_BODY_INLINE_MAX after base64). The Node
+   *  host redirects oversized bodies to a sidecar (see req_body_sample_path)
+   *  before this serializer runs. */
+  req_body_sample_b64?: string;
+  /** Filesystem path to a gzipped sidecar copy of the TRANSFORMED outgoing
+   *  request body, set by the Node host when the inline cap is exceeded.
+   *  Workers never set this (no fs); they just drop the sample. */
+  req_body_sample_path?: string;
 }
+
+/** Max base64-encoded length we'll inline in a single JSONL row. 32 KiB keeps
+ *  the dashboard's per-row parse cost manageable while still holding the
+ *  ~170 KiB raw bodies we've seen post-gzip+base64. Anything larger goes to
+ *  a sidecar file (Node host) or gets dropped (Workers host). */
+export const TRACK_BODY_INLINE_MAX = 32 * 1024;
 
 /** Hosts implement this to persist events. */
 export interface Tracker {
@@ -87,6 +119,20 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   };
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
   if (ev.error) out.error = ev.error;
+  if (ev.errorBody) out.error_body = ev.errorBody;
+  if (ev.reqBodySha8) out.req_body_sha8 = ev.reqBodySha8;
+  // Body sample: prefer the sidecar path (set by the Node host); else inline
+  // the gzipped+base64'd body if it fits; else drop (Workers cap, or no body).
+  if (ev.reqBodySamplePath) {
+    out.req_body_sample_path = ev.reqBodySamplePath;
+  } else if (ev.reqBodyGz && ev.reqBodyGz.byteLength > 0) {
+    const b64 = bytesToBase64(ev.reqBodyGz);
+    if (b64.length <= TRACK_BODY_INLINE_MAX) {
+      out.req_body_sample_b64 = b64;
+    }
+    // else: too big and no sidecar — drop it. (Workers path; on Node the host
+    // should have written the sidecar before this serializer ran.)
+  }
 
   if (info) {
     if (info.compressed !== undefined) out.compressed = info.compressed;
@@ -99,6 +145,12 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.dynamicBlockCount !== undefined) out.dynamic_block_count = info.dynamicBlockCount;
     if (info.reminderImgs !== undefined) out.reminder_imgs = info.reminderImgs;
     if (info.toolResultImgs !== undefined) out.tool_result_imgs = info.toolResultImgs;
+    if (info.droppedChars !== undefined && info.droppedChars > 0) {
+      out.dropped_chars = info.droppedChars;
+    }
+    if (info.droppedCodepointsTop && Object.keys(info.droppedCodepointsTop).length > 0) {
+      out.dropped_codepoints_top = info.droppedCodepointsTop;
+    }
     if (info.unknownStaticTags && info.unknownStaticTags.length > 0)
       out.unknown_static_tags = info.unknownStaticTags;
     if (info.systemSha8) out.system_sha8 = info.systemSha8;

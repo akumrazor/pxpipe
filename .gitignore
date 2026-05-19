@@ -11,7 +11,7 @@ build/
 # OS
 .DS_Store
 
-# Python (legacy/)
+# Python (defensive — no Python in this repo, but guard against stray scratch files)
 __pycache__/
 *.pyc
 *.pyo

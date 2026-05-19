@@ -35,6 +35,50 @@ export interface ProxyEvent {
   /** Usage block from Anthropic's response — input/output/cache tokens. */
   usage?: Usage;
   error?: string;
+  /** First ~2 KiB of the upstream response body when status is in [400, 499].
+   *  Lets us see what Anthropic actually rejected without re-running the request.
+   *  Not captured for 2xx (no error) or 5xx (we synthesize our own message). */
+  errorBody?: string;
+  /** sha256[0..8] of the TRANSFORMED outgoing request body. Set on every
+   *  /v1/messages POST regardless of status. Lets future debuggers correlate
+   *  "same payload, sometimes works, sometimes fails" without storing bodies. */
+  reqBodySha8?: string;
+  /** Full gzipped transformed body, populated only on 4xx. The Node host may
+   *  redirect this to a sidecar file (see reqBodySamplePath) before the
+   *  tracker serializes the event; Workers always inline-cap at 32 KiB. */
+  reqBodyGz?: Uint8Array;
+  /** Set by the Node host *in place of* reqBodyGz when it wrote the gzipped
+   *  body to a sidecar file. The path lands in the JSONL as
+   *  `req_body_sample_path`. */
+  reqBodySamplePath?: string;
+}
+
+/** Max chars of upstream error body we surface on ProxyEvent. Keeps the JSONL
+ *  line small while still being big enough to hold Anthropic's full error JSON
+ *  (typically a few hundred bytes). */
+const ERROR_BODY_MAX = 2048;
+
+/** Gzip a byte buffer using the standard `CompressionStream`. Available in
+ *  Node 18+ and Cloudflare Workers — no Buffer / no zlib. */
+async function gzipBytes(body: Uint8Array): Promise<Uint8Array> {
+  // `body as BufferSource`: TS doesn't model Response taking a Uint8Array
+  // directly even though it works in both runtimes.
+  const stream = new Response(body as BufferSource).body!.pipeThrough(
+    new CompressionStream('gzip'),
+  );
+  const buf = await new Response(stream).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+/** sha256[0..8] of a byte buffer, hex. Same shape as the existing sha8(text)
+ *  helper in transform.ts but works on raw bytes (no extra encode pass). */
+async function sha8Bytes(body: Uint8Array): Promise<string> {
+  // Cast to BufferSource — Web Crypto accepts Uint8Array at runtime.
+  const digest = await crypto.subtle.digest('SHA-256', body as BufferSource);
+  const bytes = new Uint8Array(digest);
+  let hex = '';
+  for (let i = 0; i < 4; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
+  return hex;
 }
 
 /**
@@ -43,14 +87,65 @@ export interface ProxyEvent {
  * the whole stream or blocking the client. Returns the un-touched response
  * to forward to the client + a Promise that resolves to the parsed Usage
  * (or undefined if we couldn't find one within the budget).
+ *
+ * For upstream 4xx responses, we instead tee the body to capture up to
+ * `ERROR_BODY_MAX` chars so the host can log what Anthropic actually rejected.
+ * 5xx still bails — those get our own synthesized error string upstream.
  */
 function teeForUsage(res: Response): {
   response: Response;
   usagePromise: Promise<Usage | undefined>;
+  errorBodyPromise: Promise<string | undefined>;
 } {
-  // Errors and bodyless responses: nothing to extract.
-  if (!res.body || res.status >= 400) {
-    return { response: res, usagePromise: Promise.resolve(undefined) };
+  // No body at all: nothing to extract on either path.
+  if (!res.body) {
+    return {
+      response: res,
+      usagePromise: Promise.resolve(undefined),
+      errorBodyPromise: Promise.resolve(undefined),
+    };
+  }
+  // 4xx: tee for the error body but skip usage scanning entirely.
+  if (res.status >= 400 && res.status < 500) {
+    const [forClient, forUs] = res.body.tee();
+    const errorBodyPromise = (async (): Promise<string | undefined> => {
+      const reader = forUs.getReader();
+      const decoder = new TextDecoder();
+      let out = '';
+      try {
+        while (out.length < ERROR_BODY_MAX) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          out += decoder.decode(value, { stream: true });
+        }
+        out += decoder.decode();
+        // Drain the rest so the tee buffer doesn't hold the stream open.
+        while (true) {
+          const { done } = await reader.read();
+          if (done) break;
+        }
+      } catch {
+        /* client may have aborted; whatever we got is fine */
+      }
+      return out.length > ERROR_BODY_MAX ? out.slice(0, ERROR_BODY_MAX) : out;
+    })();
+    return {
+      response: new Response(forClient, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      }),
+      usagePromise: Promise.resolve(undefined),
+      errorBodyPromise,
+    };
+  }
+  // 5xx: skip both (the host already synthesizes an error message).
+  if (res.status >= 500) {
+    return {
+      response: res,
+      usagePromise: Promise.resolve(undefined),
+      errorBodyPromise: Promise.resolve(undefined),
+    };
   }
   const ct = (res.headers.get('content-type') ?? '').toLowerCase();
   const [forClient, forUs] = res.body.tee();
@@ -127,6 +222,7 @@ function teeForUsage(res: Response): {
       headers: res.headers,
     }),
     usagePromise,
+    errorBodyPromise: Promise.resolve(undefined),
   };
 }
 
@@ -170,23 +266,50 @@ export function createProxy(config: ProxyConfig = {}) {
     const url = new URL(req.url);
     const path = url.pathname + url.search;
 
+    // Captured during the transform step. `reqBodyBytes` is the raw
+    // transformed body — kept around so we can gzip it lazily on 4xx without
+    // having to re-stringify. `reqBodySha8` is computed eagerly because
+    // it's cheap and lands on every event (4xx and 2xx) for correlation.
+    let reqBodyBytes: Uint8Array | undefined;
+    let reqBodySha8: string | undefined;
+
     const fire = (
       status: number,
       info?: TransformInfo,
       error?: string,
       firstByteMs?: number,
       usage?: Usage,
+      errorBody?: string,
     ): void => {
-      void config.onRequest?.({
-        method: req.method,
-        path: url.pathname,
-        status,
-        durationMs: Date.now() - t0,
-        firstByteMs,
-        info,
-        usage,
-        error,
-      });
+      const is4xx = status >= 400 && status < 500;
+      // Gzip the full body only when we actually need it — i.e. status is 4xx
+      // and we have bytes to capture. Awaiting inside an async IIFE keeps the
+      // fire() signature unchanged; the host receives the event once the
+      // gzip resolves (or immediately if not 4xx).
+      const finalize = async (): Promise<void> => {
+        let reqBodyGz: Uint8Array | undefined;
+        if (is4xx && reqBodyBytes && reqBodyBytes.byteLength > 0) {
+          try {
+            reqBodyGz = await gzipBytes(reqBodyBytes);
+          } catch {
+            // gzip failure is non-fatal — drop the body sample, keep the rest.
+          }
+        }
+        await config.onRequest?.({
+          method: req.method,
+          path: url.pathname,
+          status,
+          durationMs: Date.now() - t0,
+          firstByteMs,
+          info,
+          usage,
+          error,
+          errorBody,
+          reqBodySha8,
+          reqBodyGz,
+        });
+      };
+      void finalize();
     };
 
     // Only intercept /v1/messages POSTs. Everything else passes through.
@@ -203,6 +326,13 @@ export function createProxy(config: ProxyConfig = {}) {
         // it's a valid body and we never use SharedArrayBuffer.
         bodyOut = r.body as unknown as BodyInit;
         info = r.info;
+        // Stash the raw bytes and eagerly hash them. Hash lands on every event
+        // (cheap, ~ a SHA-256 over a few hundred KB). The bytes themselves are
+        // only gzipped+emitted on 4xx — see `fire`.
+        reqBodyBytes = r.body;
+        if (r.body.byteLength > 0) {
+          reqBodySha8 = await sha8Bytes(r.body);
+        }
       } catch (e) {
         fire(502, undefined, `transform_error: ${(e as Error).message}`);
         return new Response(JSON.stringify({ error: 'pixelpipe transform failed' }), {
@@ -240,14 +370,19 @@ export function createProxy(config: ProxyConfig = {}) {
 
     // Tee the upstream body so we can extract Anthropic's usage block. The
     // client gets one side immediately; we read the other in the background.
-    const { response: teed, usagePromise } = teeForUsage(upstreamRes);
+    // For 4xx responses we also tee to capture the error body (up to 2 KiB)
+    // so the host can log what Anthropic actually rejected.
+    const { response: teed, usagePromise, errorBodyPromise } = teeForUsage(upstreamRes);
 
-    // Fire the host event once usage is known (or once we've given up on
-    // finding it). Don't await — the response below is what unblocks the
-    // client; fire happens in the background.
-    void usagePromise
-      .then((usage) => fire(upstreamRes.status, info, undefined, firstByteMs, usage))
-      .catch(() => fire(upstreamRes.status, info, undefined, firstByteMs, undefined));
+    // Fire the host event once usage AND any captured error body are known
+    // (or once we've given up on finding them). Don't await — the response
+    // below is what unblocks the client; fire happens in the background.
+    void Promise.all([
+      usagePromise.catch(() => undefined),
+      errorBodyPromise.catch(() => undefined),
+    ]).then(([usage, errorBody]) =>
+      fire(upstreamRes.status, info, undefined, firstByteMs, usage, errorBody),
+    );
 
     return new Response(teed.body, {
       status: upstreamRes.status,
