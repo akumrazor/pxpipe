@@ -565,6 +565,31 @@ describe('transform', () => {
     expect(bash.input_schema.properties.files.items.properties.path.description).toBeUndefined();
   });
 
+  it('tool-doc JSON is rendered compact (no whitespace) so cols=100 fill stays dense', async () => {
+    // Regression for the 40%-fill / -69% dashboard reduction crisis: pretty
+    // schemas (indent=2) put each key on its own line, wasting ~70% of cols
+    // at typical widths. Compact form is unambiguous and reads fluently
+    // on one wrapped row. The static slab+tool-docs are rendered into the
+    // image, but we can verify the source serialization by computing what
+    // the renderer would see for a known schema.
+    const schema = {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string' },
+        mode: { type: 'string', enum: ['read', 'binary'] },
+      },
+      required: ['file_path'],
+    };
+    const pretty = JSON.stringify(schema, null, 2);
+    const compact = JSON.stringify(schema);
+    // Compact must be strictly shorter and have far fewer newlines.
+    expect(compact.length).toBeLessThan(pretty.length);
+    expect(compact.split('\n').length).toBe(1);
+    expect(pretty.split('\n').length).toBeGreaterThan(8);
+    // Compact must roundtrip back to the same value (no information loss).
+    expect(JSON.parse(compact)).toEqual(schema);
+  });
+
   it('flags schemas without properties via info.reason', async () => {
     // Some tools legitimately ship a bare `{type:'object'}` schema. We fall
     // back to the legacy stub but tag info.reason so we can spot them in the

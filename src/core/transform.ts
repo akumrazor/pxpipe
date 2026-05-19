@@ -736,12 +736,26 @@ function schemaHasStructure(schema: Record<string, unknown>): boolean {
   return false;
 }
 
-/** Build the "## Tool: name\n<desc>\n<schema>" block for one tool definition. */
+/** Build the "## Tool: name\n<desc>\n<schema>" block for one tool definition.
+ *
+ *  Schema serialization is **compact** (no whitespace). Pretty-printing
+ *  with 2-space indent was the dominant source of sparse fill: each schema
+ *  key on its own line, indented, wastes 70%+ of horizontal space at
+ *  cols=100. Live measurement on 2026-05-19 showed 150 KB of pretty
+ *  tool-doc JSON across ~30 tools rendering to 31 static-slab images per
+ *  request — a 40% fill ratio that pushed every request well past the
+ *  break-even point.
+ *
+ *  Compact form is still unambiguous JSON. Descriptions are already
+ *  stripped under compressSchemas so only structural keys
+ *  (type/properties/required/enum/items) remain — they read fluently
+ *  on one line. Frontier models handle compact JSON natively (it's the
+ *  default wire format for tool_use blocks). */
 function renderToolDoc(t: ToolDef, includeSchema: boolean): string {
   const parts: string[] = [`## Tool: ${t.name ?? '?'}`];
   if (t.description) parts.push(t.description);
   if (includeSchema && t.input_schema !== undefined) {
-    parts.push('```json\n' + JSON.stringify(t.input_schema, null, 2) + '\n```');
+    parts.push('```json\n' + JSON.stringify(t.input_schema) + '\n```');
   }
   return parts.join('\n');
 }
