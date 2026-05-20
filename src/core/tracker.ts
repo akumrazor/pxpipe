@@ -109,10 +109,16 @@ export interface TrackEvent {
   /** Ground-truth pre-compression token count from a parallel call to
    *  /v1/messages/count_tokens on the ORIGINAL request body. The endpoint
    *  is free (no billing). Absent when the probe failed; those events are
-   *  excluded from the dashboard's savings rollup. The post-compression
-   *  total comes from the usage block above (input + cache_create +
-   *  cache_read), so no second probe is needed. */
+   *  excluded from the dashboard's savings rollup. */
   baseline_tokens?: number;
+  /** Second baseline probe: input_tokens of the original body TRUNCATED at
+   *  the last `cache_control` marker. With `baseline_tokens` it decomposes
+   *  the unproxied path's cost into (cacheable_prefix, cold_tail) so the
+   *  dashboard can apply the SAME cache class the actual request landed in
+   *  for a true apples-to-apples counterfactual. Absent when the original
+   *  body has no cache_control markers (cacheable=0, the whole body is the
+   *  cold tail). */
+  baseline_cacheable_tokens?: number;
 
   // Errors:
   error?: string;
@@ -234,6 +240,12 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.firstUserSha8) out.first_user_sha8 = info.firstUserSha8;
     if (info.baselineTokens !== undefined && info.baselineTokens > 0) {
       out.baseline_tokens = info.baselineTokens;
+    }
+    if (
+      info.baselineCacheableTokens !== undefined
+      && info.baselineCacheableTokens > 0
+    ) {
+      out.baseline_cacheable_tokens = info.baselineCacheableTokens;
     }
   }
   if (env) {

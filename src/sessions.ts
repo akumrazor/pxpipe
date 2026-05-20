@@ -161,11 +161,13 @@ export async function aggregateSessions(
     // Cling to whichever cwd we saw first; sessions that hop directories are
     // rare and the first cwd is the most stable identifier.
     if (s.project === undefined && ev.cwd) s.project = ev.cwd;
-    // Real per-session savings: only count events that carry both a
-    // count_tokens baseline AND an upstream usage block. Same input-only
-    // weighting as the headline cards (input + cc·1.25 + cr·0.10).
-    // Events missing either side contribute to requestCount but not the
-    // savings rollup — no estimation, no synthetic 4-char/tok shortcut.
+    // Real per-session savings, cache-aware (mirrors dashboard.update()):
+    //   cacheable = baseline_cacheable_tokens or 0
+    //   cold_tail = baseline_tokens − cacheable
+    //   weight    = cr>0 ? 0.10 : cc>0 ? 1.25 : 1.0
+    //   baseline_eff = cacheable·weight + cold_tail
+    //   actual_eff   = input + cc·1.25 + cr·0.10
+    // Events missing either probe stay out of the rollup — no estimation.
     const inp = ev.input_tokens ?? 0;
     const cc = ev.cache_create_tokens ?? 0;
     const cr = ev.cache_read_tokens ?? 0;
@@ -176,11 +178,16 @@ export async function aggregateSessions(
       baseline > 0 &&
       haveUsage
     ) {
-      const actualInputEff = inp + cc * 1.25 + cr * 0.1;
-      const tokensSaved = baseline - actualInputEff;
+      const cacheable = Math.min(
+        ev.baseline_cacheable_tokens ?? 0,
+        baseline,
+      );
+      const coldTail = baseline - cacheable;
+      const weight = cr > 0 ? 0.1 : cc > 0 ? 1.25 : 1.0;
+      const baselineEff = cacheable * weight + coldTail * 1.0;
+      const actualEff = inp + cc * 1.25 + cr * 0.1;
+      const tokensSaved = baselineEff - actualEff;
       s.tokensSavedEst += Math.round(tokensSaved);
-      // charsSaved remains a coarse byte-equivalent; useful as a rough
-      // "we shaved X kB off the wire" callout but not load-bearing math.
       s.charsSaved += Math.round(tokensSaved * 4);
     }
     if (typeof ev.cache_read_tokens === 'number') {

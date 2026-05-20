@@ -384,12 +384,19 @@ export interface TransformInfo {
     | 'collapsed';
   /** Ground-truth baseline token count for THIS request, from a parallel
    *  call to /v1/messages/count_tokens on the PRE-COMPRESSION body. The
-   *  endpoint is free (no input-token billing). When present, the dashboard
-   *  computes the real saved_pct directly: actual = input + cache_create +
-   *  cache_read (from /v1/messages usage), saved = baseline - actual.
-   *  Absent when the probe failed (network, 4xx) — that event is then
-   *  excluded from the savings rollup. */
+   *  endpoint is free (no input-token billing). Absent when the probe
+   *  failed (network, 4xx) — that event is then excluded from the
+   *  savings rollup. */
   baselineTokens?: number;
+  /** Second baseline probe: input_tokens of the original body TRUNCATED at
+   *  the last `cache_control` marker — the prefix that would have cached
+   *  on the unproxied path. Used by the dashboard to weight the baseline by
+   *  the SAME cache class the proxied request landed in (cache_create ×1.25,
+   *  cache_read ×0.10, no-cache ×1.0), giving an exact cache-aware
+   *  counterfactual instead of cold-every-time. Absent when the original
+   *  body has no cache_control markers anywhere (in which case the unproxied
+   *  path doesn't cache and cacheable_prefix_tokens = 0). */
+  baselineCacheableTokens?: number;
 }
 
 // --- helpers ---------------------------------------------------------------

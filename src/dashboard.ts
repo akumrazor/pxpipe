@@ -82,29 +82,38 @@ export interface RecentRow {
 /** Aggregate over the whole session. Reset on process restart unless
  *  replay() is called to seed from the JSONL file.
  *
- *  Both sides of the savings math are INPUT-ONLY:
- *    baseline_input = count_tokens(originalBody).input_tokens          (free probe)
- *    actual_input   = input + cache_create×1.25 + cache_read×0.10      (upstream usage)
- *    saved          = baseline_input − actual_input
- *  Output is deliberately excluded — it's identical with or without
- *  compression (same prompt → same response) so it cancels in the
- *  numerator and would only drag saved_pct toward zero by inflating
- *  the denominator. Headline reads "% of input bill saved", not "% of
- *  total bill saved", and that's the honest number. */
+ *  Both sides of the savings math are INPUT-ONLY, and the baseline is
+ *  CACHE-AWARE — it weights the unproxied path's tokens by the SAME cache
+ *  class the proxied request actually landed in, so the comparison is
+ *  apples-to-apples (caching vs caching, not caching vs no-caching).
+ *
+ *    Per event:
+ *      cacheable = baseline_cacheable_tokens || 0     (tokens up to last cache_control)
+ *      cold_tail = baseline_tokens − cacheable        (always-cold input on both paths)
+ *      weight    = cr > 0 ? 0.10                      (warm hit — both paths would have cached)
+ *                : cc > 0 ? 1.25                      (cold create — both paths would create cache)
+ *                : 1.0                                (no caching — marker rejected or absent)
+ *      baseline_input_eff = cacheable × weight + cold_tail × 1.0
+ *      actual_input_eff   = input + cache_create×1.25 + cache_read×0.10
+ *      saved              = baseline_input_eff − actual_input_eff
+ *
+ *    Roll-up:
+ *      saved_pct = Σ saved / Σ baseline_input_eff × 100
+ *
+ *  Output is deliberately excluded — identical with/without compression,
+ *  same prompt → same response, so it cancels and would only drag the
+ *  percentage toward zero. Headline reads "% of input bill saved." */
 interface Totals {
   requests: number;
   compressedRequests: number;
   /** Sum of weighted actual input tokens we paid for, across all events that
-   *  also carried a baseline measurement (input + cache_create×1.25 +
-   *  cache_read×0.10). Output is excluded — output cost is identical whether
-   *  the prompt was imaged or not, so it cancels in any saved_pct that means
-   *  "fraction of INPUT spend the proxy shaved off". */
+   *  also carried a baseline_tokens measurement (input + cache_create×1.25 +
+   *  cache_read×0.10). */
   actualInputWeighted: number;
-  /** Sum of `baseline_tokens` (count_tokens result on the ORIGINAL body) for
-   *  the same events that contributed to `actualInputWeighted`. Treated as
-   *  cold-input cost — the counter-factual we'd have paid if we sent the
-   *  uncompressed body. Pairs 1:1 with `actualInputWeighted`. */
-  baselineInputTokens: number;
+  /** Sum of the cache-aware baseline (see formula above) across the same
+   *  events that contributed to `actualInputWeighted`. The honest counter-
+   *  factual cost of the unproxied path. */
+  baselineInputWeighted: number;
   startedAt: number;
 }
 
@@ -146,7 +155,7 @@ export class DashboardState {
     requests: 0,
     compressedRequests: 0,
     actualInputWeighted: 0,
-    baselineInputTokens: 0,
+    baselineInputWeighted: 0,
     startedAt: Date.now() / 1000,
   };
   private latestPng: Uint8Array | null = null;
@@ -201,10 +210,9 @@ export class DashboardState {
   /** Fold one event into the running totals + ring buffer.
    *
    *  Savings math is gated on a per-request `baseline_tokens` measurement
-   *  from the parallel count_tokens probe. When the probe is missing (e.g.
-   *  upstream 4xx'd the side call, or the request was a non-/v1/messages
-   *  passthrough), we still count the request but skip its savings
-   *  contribution — no estimation, no α-regression, no inferred numbers. */
+   *  from the parallel count_tokens probe AND an upstream usage block.
+   *  When either is missing, we still count the request but skip its
+   *  savings contribution — no estimation. */
   update(ev: ProxyEvent): void {
     // Stash the image bytes before they get GC'd by the request finishing.
     if (ev.info) this.captureImage(ev.info);
@@ -221,20 +229,31 @@ export class DashboardState {
     const baseline = info?.baselineTokens;
     const haveBaseline = typeof baseline === 'number' && baseline > 0;
 
-    // Weighted INPUT cost we actually paid this turn. Output is identical
-    // with or without compression so it's deliberately not in the savings
-    // numerator/denominator — see Totals.actualInputWeighted comment.
+    // Weighted INPUT cost we actually paid this turn.
     const actualInputEff = haveUsage ? inp + cc * 1.25 + cr * 0.1 : 0;
+
+    // Cache-aware baseline: decompose the unproxied counterfactual into
+    // (cacheable_prefix, cold_tail) using the second count_tokens probe,
+    // then weight the prefix by the SAME cache class the actual request
+    // landed in. No assumptions — every input is a measurement.
+    //   cacheable = tokens up to last cache_control marker (or 0 if no markers)
+    //   cold_tail = baseline − cacheable                  (always cold input)
+    //   weight    = cr > 0 ? 0.10  (warm hit — both paths cache)
+    //             : cc > 0 ? 1.25  (cold create — both paths build the cache)
+    //             :          1.0   (no caching — marker rejected or absent)
+    let baselineInputEff = 0;
+    if (haveBaseline && haveUsage) {
+      const cacheable = Math.min(info?.baselineCacheableTokens ?? 0, baseline);
+      const coldTail = baseline - cacheable;
+      const weight = cr > 0 ? 0.1 : cc > 0 ? 1.25 : 1.0;
+      baselineInputEff = cacheable * weight + coldTail * 1.0;
+    }
 
     this.totals.requests += 1;
     if (compressed) this.totals.compressedRequests += 1;
 
-    // Real savings rollup: ONLY events with both a count_tokens baseline
-    // and a billed usage block. Counter-factual: if we'd sent the original
-    // body cold, we'd have paid `baseline × 1.0` input rate; we actually
-    // paid `actualInputEff`. saved = baseline − actualInputEff.
     if (haveBaseline && haveUsage) {
-      this.totals.baselineInputTokens += baseline;
+      this.totals.baselineInputWeighted += baselineInputEff;
       this.totals.actualInputWeighted += actualInputEff;
     }
 
@@ -249,9 +268,9 @@ export class DashboardState {
       cache_create: haveUsage ? cc : undefined,
       cache_read: haveUsage ? cr : undefined,
       actual_input: haveUsage ? round1(actualInputEff) : undefined,
-      baseline_input: haveBaseline ? baseline : undefined,
+      baseline_input: haveBaseline && haveUsage ? round1(baselineInputEff) : undefined,
       session_saved_so_far_delta:
-        haveBaseline && haveUsage ? round1(baseline - actualInputEff) : undefined,
+        haveBaseline && haveUsage ? round1(baselineInputEff - actualInputEff) : undefined,
     };
     this.recent.push(row);
     if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
@@ -287,8 +306,17 @@ export class DashboardState {
       const cr = t.cache_read_tokens ?? 0;
       const haveUsage = inp > 0 || cc > 0 || cr > 0;
       const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
+      const cacheable = (t as { baseline_cacheable_tokens?: number })
+        .baseline_cacheable_tokens ?? 0;
       const haveBaseline = typeof baseline === 'number' && baseline > 0;
       const actualInputEff = haveUsage ? inp + cc * 1.25 + cr * 0.1 : 0;
+      let baselineInputEff = 0;
+      if (haveBaseline && haveUsage) {
+        const c = Math.min(cacheable, baseline as number);
+        const coldTail = (baseline as number) - c;
+        const weight = cr > 0 ? 0.1 : cc > 0 ? 1.25 : 1.0;
+        baselineInputEff = c * weight + coldTail * 1.0;
+      }
       const row: RecentRow = {
         ts: Date.parse(t.ts) / 1000,
         method: t.method,
@@ -300,7 +328,8 @@ export class DashboardState {
         cache_create: t.cache_create_tokens,
         cache_read: t.cache_read_tokens,
         actual_input: haveUsage ? round1(actualInputEff) : undefined,
-        baseline_input: haveBaseline ? baseline : undefined,
+        baseline_input:
+          haveBaseline && haveUsage ? round1(baselineInputEff) : undefined,
       };
       this.recent.push(row);
     }
@@ -309,16 +338,16 @@ export class DashboardState {
   // ---- HTTP handlers ------------------------------------------------------
 
   serveStats(): Response {
-    // Real saved% from REAL numbers:
-    //   baseline = sum of count_tokens(originalBody) across events with a probe
-    //   actual   = sum of (input + cache_create*1.25 + cache_read*0.10) over the same events
-    //   saved    = baseline - actual
-    // Output is excluded from both sides — it doesn't change with compression
-    // and would just inflate the denominator. Events without a baseline probe
-    // (count_tokens 4xx'd, or pre-feature replay) contribute to `requests`
-    // but not to the savings rollup; the operator sees a tighter `measured`
-    // count surface what's actually behind the headline.
-    const baseline = this.totals.baselineInputTokens;
+    // Real cache-aware saved%:
+    //   per event: baseline_input_eff = cacheable × weight + cold_tail × 1.0
+    //              where weight matches the actual response's cache class
+    //              (cr>0 → 0.10, cc>0 → 1.25, neither → 1.0)
+    //   actual_input_eff = input + cache_create×1.25 + cache_read×0.10
+    //   saved_pct = Σ saved / Σ baseline_input_eff × 100
+    // Both sides input-only; output excluded because it's identical with
+    // or without compression. Events missing either probe stay out of the
+    // rollup — operator sees the requests counter but not phantom savings.
+    const baseline = this.totals.baselineInputWeighted;
     const actual = this.totals.actualInputWeighted;
     const saved = baseline - actual;
     const pct = baseline > 0 ? (saved / baseline) * 100 : 0;
@@ -326,7 +355,7 @@ export class DashboardState {
     const payload = {
       requests: this.totals.requests,
       compressed_requests: this.totals.compressedRequests,
-      baseline_input_tokens: Math.round(baseline),
+      baseline_input_weighted: Math.round(baseline),
       actual_input_weighted: Math.round(actual),
       saved_input_tokens: Math.round(saved),
       saved_pct: round1(pct),
@@ -790,7 +819,7 @@ async function tick() {
     // No estimation, no α, no range — just two real numbers subtracted.
     document.getElementById('m_saved').textContent = numFmt(s.saved_input_tokens);
     document.getElementById('m_saved_sub').textContent =
-      \`\${numFmt(s.actual_input_weighted)} paid · \${numFmt(s.baseline_input_tokens)} baseline\`;
+      \`\${numFmt(s.actual_input_weighted)} paid · \${numFmt(s.baseline_input_weighted)} baseline\`;
     // $ saved card: saved input tokens × input rate. Single number, no range.
     const inRate = s.pricing_assumptions && s.pricing_assumptions.input_per_mtok;
     document.getElementById('m_usd').textContent = \`$\${(s.saved_usd || 0).toFixed(4)}\`;
@@ -864,14 +893,16 @@ function shortPath(p) {
 
 // ---- savings math panels -------------------------------------------------
 //
-// Renders the "show calculation" blocks beneath each savings card. Every
-// number on the headline cards is a straight subtraction or rate-multiply
-// of two real measurements:
-//   baseline = /v1/messages/count_tokens(originalBody).input_tokens, summed
-//   actual   = (input + cache_create·1.25 + cache_read·0.10), summed
-// Output is excluded from both sides because it's identical with or
-// without compression. No α, no fit, no estimation — operator can copy
-// the values into a calculator and reproduce the headline byte-identically.
+// Renders the "show calculation" blocks beneath each savings card. The
+// baseline is CACHE-AWARE — per event we measure:
+//   baseline_input_eff = cacheable × weight + cold_tail × 1.0
+//     cacheable  = count_tokens(originalBody truncated at last cache_control)
+//     cold_tail  = count_tokens(originalBody) − cacheable
+//     weight     = matches the actual response's cache class
+//                  (cr>0 → 0.10, cc>0 → 1.25, neither → 1.0)
+//   actual_input_eff = input + cache_create×1.25 + cache_read×0.10
+// Both probes are free. Output is excluded — identical with or without
+// compression. No α, no fit, no estimation.
 function renderSavingsMath(s) {
   const pa = s.pricing_assumptions || {};
 
@@ -880,7 +911,7 @@ function renderSavingsMath(s) {
     '<div><span class="k">formula:</span> <span class="v">saved = baseline − actual</span></div>'
     + '<div><span class="k">weights:</span> <span class="v">input ×1.0, cache_create ×1.25, cache_read ×0.10</span></div>'
     + '<div style="height:6px"></div>'
-    + fmtRow('baseline', s.baseline_input_tokens, '(count_tokens on original body)')
+    + fmtRow('baseline', s.baseline_input_weighted, '(cache-aware: cacheable·weight + cold_tail)')
     + fmtRow('actual', s.actual_input_weighted, '(input + cc·1.25 + cr·0.10 from usage)')
     + fmtRow('saved', s.saved_input_tokens, '<span class="op">=</span> baseline − actual')
     + '<span class="src">output excluded — identical with/without compression</span>';
@@ -891,7 +922,7 @@ function renderSavingsMath(s) {
     '<div><span class="k">formula:</span> <span class="v">$ = saved × $'
       + inRate + '/Mtok</span></div>'
     + '<div style="height:6px"></div>'
-    + fmtRow('saved_tokens', s.saved_input_tokens, '(input-side, weighted)')
+    + fmtRow('saved_tokens', s.saved_input_tokens, '(cache-aware, input-side)')
     + fmtRow('input_rate', \`$\${inRate}/Mtok\`, '(Opus 4.7 base input)')
     + fmtRow('saved_usd',
              \`$\${(s.saved_usd || 0).toFixed(4)}\`,
@@ -902,8 +933,10 @@ function renderSavingsMath(s) {
   document.getElementById('m_pct_math').innerHTML =
     '<div><span class="k">formula:</span> <span class="v">'
       + 'saved_pct = (baseline − actual) / baseline × 100</span></div>'
+    + '<div><span class="k">per event:</span> <span class="v">'
+      + 'baseline = cacheable·weight + cold_tail, weight matches actual cache class</span></div>'
     + '<div style="height:6px"></div>'
-    + fmtRow('baseline', s.baseline_input_tokens, '(count_tokens on original body)')
+    + fmtRow('baseline', s.baseline_input_weighted, '(cache-aware counterfactual)')
     + fmtRow('actual', s.actual_input_weighted, '(weighted upstream usage)')
     + fmtRow('saved', s.saved_input_tokens, '<span class="op">=</span> baseline − actual')
     + fmtRow('saved_pct', (s.saved_pct || 0).toFixed(1) + '%',

@@ -291,6 +291,126 @@ function buildCountTokensBody(bytes: Uint8Array): Uint8Array | null {
   }
 }
 
+/** Type guard for content blocks that may carry a cache_control marker.
+ *  Anthropic accepts `cache_control` on: any system block, any message
+ *  content block, any tool definition. We don't care about the marker's
+ *  value — only its presence/position. */
+function hasCacheControl(x: unknown): boolean {
+  return (
+    typeof x === 'object'
+    && x !== null
+    && (x as { cache_control?: unknown }).cache_control != null
+  );
+}
+
+/** Build a body that contains EXACTLY the tokens forming the longest
+ *  cacheable prefix on the unproxied path — everything up to and INCLUDING
+ *  the last `cache_control` marker in the original request, with everything
+ *  after that marker stripped. count_tokens on this body returns
+ *  `cacheable_prefix_tokens`; subtracting from the full count_tokens gives
+ *  `cold_tail_tokens` (always-cold input on both proxied and unproxied paths).
+ *
+ *  Anthropic's cache-traversal order is tools → system → messages. We walk
+ *  messages first (latest), then system, then tools — the FIRST one we find
+ *  a marker in (walking backward) is the latest in cache order. Everything
+ *  after that marker in the same section is dropped; later sections are
+ *  dropped wholesale.
+ *
+ *  Returns null when the original body has zero `cache_control` markers
+ *  anywhere — caller treats that as `cacheable_prefix_tokens = 0`. The
+ *  unproxied path doesn't cache anything in that case, so the full body
+ *  is cold input. */
+function buildCountTokensCacheablePrefix(bytes: Uint8Array): Uint8Array | null {
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (typeof obj.model !== 'string') return null;
+
+  const system = obj.system;
+  const messages = obj.messages;
+  const tools = obj.tools;
+
+  // Walk messages backward; for each message walk content blocks backward.
+  // First block we hit with cache_control is the latest marker in the
+  // entire request (messages come last in cache traversal order).
+  let truncated: Record<string, unknown> | null = null;
+  if (Array.isArray(messages)) {
+    for (let mi = messages.length - 1; mi >= 0 && truncated == null; mi--) {
+      const msg = messages[mi] as { role?: unknown; content?: unknown };
+      const content = msg?.content;
+      if (Array.isArray(content)) {
+        for (let bi = content.length - 1; bi >= 0; bi--) {
+          if (hasCacheControl(content[bi])) {
+            // Truncate this message's content at and including the marker.
+            const truncatedMsg = { ...msg, content: content.slice(0, bi + 1) };
+            const truncatedMessages = messages.slice(0, mi).concat([truncatedMsg]);
+            truncated = {
+              model: obj.model,
+              messages: truncatedMessages,
+            };
+            if (system !== undefined) truncated.system = system;
+            if (tools !== undefined) truncated.tools = tools;
+            break;
+          }
+        }
+      } else if (hasCacheControl(msg)) {
+        // String-content message with a marker — keep up to this message.
+        truncated = {
+          model: obj.model,
+          messages: messages.slice(0, mi + 1),
+        };
+        if (system !== undefined) truncated.system = system;
+        if (tools !== undefined) truncated.tools = tools;
+      }
+    }
+  }
+
+  // No marker in messages — check system (next-earliest in cache order).
+  // count_tokens requires non-empty messages, so we append a 1-token sentinel
+  // user message and subtract its weight on the consumer side. Or simpler:
+  // include a single-char user message and accept ~1 token of noise.
+  if (truncated == null && Array.isArray(system)) {
+    for (let si = system.length - 1; si >= 0; si--) {
+      if (hasCacheControl(system[si])) {
+        truncated = {
+          model: obj.model,
+          system: system.slice(0, si + 1),
+          messages: [{ role: 'user', content: 'x' }],
+        };
+        if (tools !== undefined) truncated.tools = tools;
+        break;
+      }
+    }
+  }
+
+  // No marker in system — check tools (earliest in cache order). Same
+  // sentinel-message trick to keep count_tokens happy.
+  if (truncated == null && Array.isArray(tools)) {
+    for (let ti = tools.length - 1; ti >= 0; ti--) {
+      if (hasCacheControl(tools[ti])) {
+        truncated = {
+          model: obj.model,
+          tools: tools.slice(0, ti + 1),
+          messages: [{ role: 'user', content: 'x' }],
+        };
+        break;
+      }
+    }
+  }
+
+  // Filter through the same whitelist as the full-body probe to avoid 400s
+  // from stray fields slipping into the truncated copy.
+  if (truncated == null) return null;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(truncated)) {
+    if (COUNT_TOKENS_FIELDS.has(k)) out[k] = truncated[k];
+  }
+  return new TextEncoder().encode(JSON.stringify(out));
+}
+
 /** POST /v1/messages/count_tokens with the given body. Returns the upstream's
  *  `input_tokens` number or null on any failure. count_tokens is documented
  *  as a free endpoint (no input-token billing) — we use it once per request
@@ -354,16 +474,27 @@ export function createProxy(config: ProxyConfig = {}) {
             // gzip failure is non-fatal — drop the body sample, keep the rest.
           }
         }
-        // Wait for the baseline count_tokens probe before persisting the
-        // event so baseline_tokens lands on the same row as the usage block.
-        // null result (probe failed) leaves the field absent — dashboard
-        // skips that event from the savings math.
-        if (baselinePromise && info) {
-          try {
-            const b = await baselinePromise;
-            if (b !== null) info.baselineTokens = b;
-          } catch {
-            /* probe threw — drop, keep the rest of the event intact */
+        // Wait for the baseline count_tokens probes before persisting the
+        // event so both numbers land on the same row as the usage block.
+        // Each probe is independent: full-body baseline can land even if the
+        // cacheable-prefix probe fails (and vice versa). null/missing leaves
+        // the field absent; the dashboard's per-event math degrades cleanly.
+        if (info) {
+          if (baselinePromise) {
+            try {
+              const b = await baselinePromise;
+              if (b !== null) info.baselineTokens = b;
+            } catch {
+              /* probe threw — drop, keep the rest of the event intact */
+            }
+          }
+          if (baselineCacheablePromise) {
+            try {
+              const c = await baselineCacheablePromise;
+              if (c !== null) info.baselineCacheableTokens = c;
+            } catch {
+              /* probe threw — leave field absent */
+            }
           }
         }
         await config.onRequest?.({
@@ -389,11 +520,20 @@ export function createProxy(config: ProxyConfig = {}) {
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
 
-    // Ground-truth baseline measurement. Fires /v1/messages/count_tokens on
-    // the PRE-COMPRESSION body in parallel with the main forward. Resolves
-    // to a number (baseline tokens) or null (probe failed, e.g. count_tokens
-    // 4xx'd). Lands on info.baselineTokens before the host event persists.
+    // Ground-truth baseline measurement. Fires /v1/messages/count_tokens TWO
+    // ways on the PRE-COMPRESSION body in parallel with the main forward:
+    //   baselinePromise          → full-body input_tokens (cold cost)
+    //   baselineCacheablePromise → input_tokens of the body TRUNCATED at the
+    //                              last cache_control marker (the prefix that
+    //                              would have cached on the unproxied path)
+    // Difference of the two is `cold_tail_tokens` (always-cold input on both
+    // proxied and unproxied paths). The dashboard combines them with the
+    // actual usage block's cache class to get an exact cache-aware baseline,
+    // not a cold-every-time approximation. Both resolve to a number or null
+    // (probe failed or no markers); land on info.baseline*Tokens before the
+    // host event persists.
     let baselinePromise: Promise<number | null> | undefined;
+    let baselineCacheablePromise: Promise<number | null> | undefined;
 
     if (isMessages) {
       const bodyIn = new Uint8Array(await req.arrayBuffer());
@@ -410,17 +550,28 @@ export function createProxy(config: ProxyConfig = {}) {
           reqBodySha8 = await sha8Bytes(r.body);
         }
 
-        // Kick off the count_tokens probe on the ORIGINAL body BEFORE the
-        // main forward so the two calls overlap. Anthropic doesn't bill
-        // count_tokens, and the result is the only honest baseline we can
-        // get — the post-compression token count comes back free in the
-        // /v1/messages response usage block.
+        // Kick off the count_tokens probes on the ORIGINAL body BEFORE the
+        // main forward so all three calls (full probe, cacheable-prefix probe,
+        // main /v1/messages) overlap. Anthropic doesn't bill count_tokens, so
+        // the cost is wall-clock only — typically ~30-80ms, fully hidden by
+        // the main forward latency.
         const ctBody = buildCountTokensBody(bodyIn);
         if (ctBody) {
           const ctHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
           ctHeaders.set('content-type', 'application/json');
           if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
           baselinePromise = countTokensUpstream(upstream, ctBody, ctHeaders);
+          // Second probe: body truncated at the last cache_control marker.
+          // Null body = no markers exist → cacheable=0 by definition, no
+          // probe needed.
+          const ctCacheableBody = buildCountTokensCacheablePrefix(bodyIn);
+          if (ctCacheableBody) {
+            baselineCacheablePromise = countTokensUpstream(
+              upstream,
+              ctCacheableBody,
+              new Headers(ctHeaders),
+            );
+          }
         }
       } catch (e) {
         fire(502, undefined, `transform_error: ${(e as Error).message}`);
