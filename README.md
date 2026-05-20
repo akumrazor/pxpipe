@@ -34,6 +34,15 @@ smaller margin because both paths pay 0.1× `cache_read`. **100%
 reasoning quality preserved**, **byte-identical fixed text** every turn
 for a clean prompt-cache hit.
 
+> **Why this works now.** Pre-4.7 vision wasn't accurate enough on
+> dense monospace glyphs — OCR errors would corrupt the prompt before
+> the model read it. Opus 4.7's vision stack ([released 2026-04-16](https://www.anthropic.com/news/claude-opus-4-7))
+> bumps the long-edge image cap from 1568 px to 2576 px (3.3× more
+> pixels) and reports document-OCR benchmark gains large enough
+> ([DocVQA 87→94%, ChartQA 80→88%](https://www.anthropic.com/news/claude-opus-4-7))
+> to make this trade safe. Pixelpipe still renders at 1568×1568 — the
+> *model* OCR fidelity is what changed, not the renderer.
+
 Runs on **Node 18+** and **Cloudflare Workers** from the same source.
 
 ```
