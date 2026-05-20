@@ -175,7 +175,7 @@ const CHARS_PER_TOKEN = 4;
  *  tool_result content have unknown shape (could be raw English prose
  *  with cpt~4). Leaving those at CHARS_PER_TOKEN=4 preserves the
  *  conservative bias where shape isn't known a priori. */
-const SLAB_CHARS_PER_TOKEN = 2.5;
+export const SLAB_CHARS_PER_TOKEN = 2.5;
 
 /** Empirical chars-per-token for the *history compression* path.
  *
@@ -204,7 +204,7 @@ const SLAB_CHARS_PER_TOKEN = 2.5;
  *  a LOWER bound on real text cost whenever real cpt ≤ 2.5 (= every
  *  history sample we've ever observed). Image-cost-vs-estimated-text
  *  passing therefore implies image-cost-vs-real-text passing. */
-const HISTORY_CHARS_PER_TOKEN = 2.5;
+export const HISTORY_CHARS_PER_TOKEN = 2.5;
 
 /** Empirical per-image cost at numCols=1. Source: dashboard.ts measurement
  *  trace. Kept here as a constant rather than imported from dashboard.ts

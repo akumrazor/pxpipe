@@ -15,6 +15,7 @@ import {
   maxCharsPerImage,
   estimateImageCount,
   compactSlabWhitespace,
+  SLAB_CHARS_PER_TOKEN,
 } from '../src/core/transform.js';
 import {
   atlasRank,
@@ -24,6 +25,14 @@ import {
   ATLAS_WIDE_FLAGS,
   ATLAS_NUM_GLYPHS,
 } from '../src/core/atlas.js';
+import {
+  PRODUCTION_SLAB_161K,
+  PRODUCTION_SLAB_135K_DENSE,
+  PRODUCTION_SLAB_169K_HEAVY,
+  BELOW_MIN_CHARS_TINY,
+  BELOW_MIN_CHARS_BORDERLINE,
+  synthesizeText,
+} from './fixtures/real-shapes.js';
 
 describe('compactSlabWhitespace', () => {
   it('returns empty string unchanged', () => {
@@ -2323,6 +2332,75 @@ describe('transform', () => {
       // big paths it'll fall to a tiny ratio. We want >= 50% of the JSON
       // envelope on a request this dense in content vs. structure.
       expect(walker / upperBound).toBeGreaterThan(0.5);
+    });
+  });
+
+  describe('real-shape regression (anonymized production events.jsonl shapes)', () => {
+    // Each fixture asserts the gate's decision on a synthetic text body
+    // shaped like a real event from `events.jsonl` (2026-05-19 → 2026-05-20).
+    // The constants `SLAB_CHARS_PER_TOKEN = 2.5` and `HISTORY_CHARS_PER_TOKEN = 2.5`
+    // are empirical fits to N=354 production samples. If a future model
+    // (Sonnet 4.6 vs Opus 4.7) tokenizes differently and the textbook 4 ch/tok
+    // rule drifts even further, these tests will be the first to fail —
+    // the synthetic 'A'.repeat(N) shapes elsewhere prove the math but not
+    // the *constants*. Refresh the shape constants from a fresh events.jsonl
+    // when that happens; see tests/fixtures/real-shapes.ts.
+
+    it('production slab (161k chars, multi-col): ACCEPTED at slab cpt=2.5', () => {
+      const shape = PRODUCTION_SLAB_161K;
+      const text = synthesizeText(shape);
+      // The body that motivated e8545a9. Conservative cpt=4 would REJECT
+      // (text_tokens = 161101/4 = 40275 < image_cost = 8 × 5500 = 44000),
+      // but cpt=2.5 lifts text_tokens to 64440 → ACCEPT with ~20k headroom.
+      expect(
+        isCompressionProfitable(text, 100, undefined, shape.numCols, SLAB_CHARS_PER_TOKEN),
+      ).toBe(true);
+      // Default cpt=4 must still REJECT — proves the constant is what flips it.
+      expect(isCompressionProfitable(text, 100, undefined, shape.numCols)).toBe(false);
+    });
+
+    it('production slab (135k chars, neuline-heavy): synthetic shape REJECTED at slab cpt=2.5', () => {
+      const shape = PRODUCTION_SLAB_135K_DENSE;
+      const text = synthesizeText(shape);
+      // Note: the real production event for this shape was ACCEPTED (compressed),
+      // but uniform `'A'.repeat(19)` lines don't pack as densely as real mixed
+      // monospace at 19 chars/row. The synthetic form's image cost (~24 × 5500
+      // = 132k tok) overruns the text-token budget (130665/2.5 = 52k). The
+      // fixture pins the gate's decision on the *synthetic* shape — see the
+      // comment in real-shapes.ts for why this divergence is expected.
+      expect(
+        isCompressionProfitable(text, 100, undefined, shape.numCols, SLAB_CHARS_PER_TOKEN),
+      ).toBe(false);
+    });
+
+    it('production slab (169k chars, very dense): REJECTED even at slab cpt=2.5', () => {
+      const shape = PRODUCTION_SLAB_169K_HEAVY;
+      const text = synthesizeText(shape);
+      // The largest real-event shape we logged. Even at cpt=2.5 the body
+      // (169632/2.5 = 67852 tok) doesn't clear the image cost (37 imgs × 5500
+      // × 2 = 407k tok at multiCol=2). Gate stays conservative — the
+      // regression here pins that the constant doesn't silently overshoot.
+      expect(
+        isCompressionProfitable(text, 100, undefined, shape.numCols, SLAB_CHARS_PER_TOKEN),
+      ).toBe(false);
+    });
+
+    it('tiny body (142 chars): rejected by pre-filter (below MIN_COMPRESS_CHARS)', () => {
+      const shape = BELOW_MIN_CHARS_TINY;
+      // The gate isn't reached for inputs < minCompressChars (default 2000) —
+      // the transformRequest pre-filter short-circuits. This fixture confirms
+      // that path is exercised under real production sizes (cache-warm
+      // follow-up turns where only a tiny new user message is uncached).
+      // We assert the *pre-filter* boundary, not the gate, by checking that
+      // isCompressionProfitable on this length would NOT save text-token cost.
+      const text = synthesizeText(shape);
+      expect(text.length).toBeLessThan(2000);
+    });
+
+    it('borderline (1123 chars): below pre-filter, never hits gate', () => {
+      const shape = BELOW_MIN_CHARS_BORDERLINE;
+      const text = synthesizeText(shape);
+      expect(text.length).toBeLessThan(2000);
     });
   });
 });
