@@ -479,21 +479,43 @@ export function createProxy(config: ProxyConfig = {}) {
         // cacheable-prefix probe fails (and vice versa). null/missing leaves
         // the field absent; the dashboard's per-event math degrades cleanly.
         if (info) {
+          // Track both halves of the cache-aware baseline so we can honestly
+          // report whether a row is fully measured, partially measured, or
+          // un-measured. Without this, a missing cacheable-prefix probe was
+          // silently bucketed as cacheable=0 by the dashboard, which inflates
+          // the baseline and thus "$ saved". See dashboard.ts for the gating.
+          let baselineResolved: number | null = null;
+          let cacheableExpected = false;
+          let cacheableResolved: number | null = null;
           if (baselinePromise) {
             try {
-              const b = await baselinePromise;
-              if (b !== null) info.baselineTokens = b;
+              baselineResolved = await baselinePromise;
+              if (baselineResolved !== null) info.baselineTokens = baselineResolved;
             } catch {
               /* probe threw — drop, keep the rest of the event intact */
             }
           }
           if (baselineCacheablePromise) {
+            cacheableExpected = true;
             try {
-              const c = await baselineCacheablePromise;
-              if (c !== null) info.baselineCacheableTokens = c;
+              cacheableResolved = await baselineCacheablePromise;
+              if (cacheableResolved !== null) info.baselineCacheableTokens = cacheableResolved;
             } catch {
               /* probe threw — leave field absent */
             }
+          }
+          if (baselineResolved === null) {
+            info.baselineProbeStatus = 'failed';
+          } else if (cacheableExpected && cacheableResolved === null) {
+            // Body had cache_control markers but the prefix probe didn't
+            // come back. The dashboard MUST NOT treat this as cacheable=0
+            // (that would charge the unproxied counterfactual as if it had
+            // no cache reuse, fabricating savings). It excludes the row.
+            info.baselineProbeStatus = 'partial';
+          } else {
+            // Either both probes resolved, or the body had no markers and
+            // cacheable=0 is exact by construction. Either way, honest.
+            info.baselineProbeStatus = 'ok';
           }
         }
         await config.onRequest?.({

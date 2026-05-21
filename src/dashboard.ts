@@ -272,7 +272,19 @@ export class DashboardState {
     const cr = u?.cache_read_input_tokens ?? 0;
     const haveUsage = u !== undefined && (inp > 0 || out > 0 || cc > 0 || cr > 0);
     const baseline = info?.baselineTokens;
-    const haveBaseline = typeof baseline === 'number' && baseline > 0;
+    // Honest gating: only attribute savings when BOTH baseline probes
+    // resolved (status === 'ok'). When the cacheable-prefix probe failed
+    // (status === 'partial') we previously fell through to cacheable=0,
+    // which silently charges the unproxied counterfactual the cold-input
+    // rate on tokens that actually would have been cache-discounted —
+    // fabricating "$ saved". Excluding the row is the only honest move
+    // until the probe succeeds.
+    const probeOk = info?.baselineProbeStatus === 'ok'
+      // Back-compat: hosts that haven't adopted baselineProbeStatus yet
+      // still see fields land; we accept legacy rows where the full-body
+      // probe resolved AND (either no markers existed OR cacheable did too).
+      || (info?.baselineProbeStatus === undefined && baseline !== undefined && baseline > 0);
+    const haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
 
     // Weighted INPUT cost we actually paid this turn.
     const actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
@@ -379,7 +391,12 @@ export class DashboardState {
       const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
       const cacheable = (t as { baseline_cacheable_tokens?: number })
         .baseline_cacheable_tokens ?? 0;
-      const haveBaseline = typeof baseline === 'number' && baseline > 0;
+      const probeStatus = (t as { baseline_probe_status?: string }).baseline_probe_status;
+      // Same gating rule as update(): require an explicit 'ok' status when
+      // present; fall back to "have a baseline number" for legacy JSONL.
+      const probeOk = probeStatus === 'ok'
+        || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
+      const haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
       const actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
       const baselineInputEff =
         haveBaseline && haveUsage

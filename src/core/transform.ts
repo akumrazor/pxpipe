@@ -669,6 +669,22 @@ export interface TransformInfo {
    *  body has no cache_control markers anywhere (in which case the unproxied
    *  path doesn't cache and cacheable_prefix_tokens = 0). */
   baselineCacheableTokens?: number;
+  /** Status of the cache-aware baseline probe for this request.
+   *
+   *   'ok'       both `baselineTokens` and `baselineCacheableTokens` resolved
+   *              (or the body had no `cache_control` markers, so cacheable=0
+   *              is exact, not estimated).
+   *   'partial'  the full-body probe resolved but the cacheable-prefix probe
+   *              didn't return a number even though the body had markers.
+   *              We can't honestly attribute savings on this row — the
+   *              dashboard must exclude it from the saved-cost rollup
+   *              rather than fall through to `cacheable=0`, which biases
+   *              the baseline up (= dishonest "$ saved").
+   *   'failed'   the full-body probe itself didn't resolve. No baseline at all.
+   *   undefined  no probe was attempted (proxy path didn't run /v1/messages
+   *              with a parseable body).
+   */
+  baselineProbeStatus?: 'ok' | 'partial' | 'failed';
 }
 
 // --- helpers ---------------------------------------------------------------

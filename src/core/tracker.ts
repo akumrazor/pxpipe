@@ -161,6 +161,10 @@ export interface TrackEvent {
    *  body has no cache_control markers (cacheable=0, the whole body is the
    *  cold tail). */
   baseline_cacheable_tokens?: number;
+  /** Status of the cache-aware baseline probes for this request. See
+   *  TransformInfo.baselineProbeStatus for semantics. Dashboards must only
+   *  attribute "$ saved" to rows with status === 'ok'. */
+  baseline_probe_status?: 'ok' | 'partial' | 'failed';
 
   // Errors:
   error?: string;
@@ -298,6 +302,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       && info.baselineCacheableTokens > 0
     ) {
       out.baseline_cacheable_tokens = info.baselineCacheableTokens;
+    }
+    if (info.baselineProbeStatus !== undefined) {
+      out.baseline_probe_status = info.baselineProbeStatus;
     }
   }
   if (env) {
