@@ -879,9 +879,16 @@ async function main(): Promise<void> {
   // baked into transform.ts. There are no behavior toggles: system slab,
   // reminders, tool_results, and history compression all run
   // unconditionally; the per-block break-even gate decides per-call
-  // whether to actually image each piece. Per-request α
-  // injection happens later via the function-form `transform` in
-  // ProxyConfig so the gate gets the dashboard's live empirical rate.
+  // whether to actually image each piece. The function-form `transform`
+  // below is ONLY a kill switch (PXPIPE_DISABLE / dashboard toggle →
+  // compress:false); on the active path it returns {}, so the gate always
+  // runs on static DEFAULTS — charsPerToken=4, priorWarm*=0 — which leaves
+  // the warm-baseline and anti-flapping burn terms inert. That is
+  // deliberate, NOT an oversight: there is no live-α feedback loop from
+  // the dashboard. Telemetry (2026-06, 897 sessions / 21,347 measured
+  // rows) showed 5 mode flips ever and losses at 0.8% of wins — all
+  // one-time cache-create amortization — so closing the loop would not
+  // change decisions. Re-run that reconciliation before wiring one in.
   const tracker: Tracker = new FileTracker(opts.eventsFile);
 
   // Sidecar dir for oversized 4xx request-body samples. Lives next to the
