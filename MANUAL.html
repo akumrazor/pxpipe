@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Manual de uso — pxpipe</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-soft: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --code-bg: #1f2428;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+    font-size: 16px;
+  }
+  .container { max-width: 920px; margin: 0 auto; padding: 48px 32px 80px; }
+  header { border-bottom: 1px solid var(--border); padding-bottom: 24px; margin-bottom: 28px; }
+  h1 { font-size: 2.1em; margin: 0 0 12px; color: #fff; line-height: 1.2; }
+  h2 {
+    color: #fff; font-size: 1.4em; margin: 44px 0 14px;
+    padding-bottom: 7px; border-bottom: 1px solid var(--border);
+  }
+  h3 { color: var(--accent); font-size: 1.08em; margin: 24px 0 10px; }
+  p, li { color: var(--text); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    background: var(--code-bg); padding: 2px 6px; border-radius: 4px;
+    font-size: 0.87em; color: #f0883e;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 15px 18px; overflow-x: auto; margin: 12px 0;
+  }
+  pre code { background: none; padding: 0; color: var(--text); font-size: 0.85em; line-height: 1.5; }
+  table {
+    border-collapse: collapse; width: 100%; margin: 14px 0;
+    background: var(--bg-soft); border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+  }
+  th, td { padding: 9px 14px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: #21262d; color: #fff; font-weight: 600; }
+  td code { font-size: 0.82em; }
+  ul, ol { padding-left: 24px; }
+  li { margin: 4px 0; }
+  blockquote {
+    margin: 14px 0; padding: 10px 18px; background: var(--bg-soft);
+    border-left: 3px solid var(--accent); color: var(--text-dim); border-radius: 0 6px 6px 0;
+  }
+  blockquote p { margin: 0.4em 0; color: var(--text); }
+  .badge {
+    display: inline-block; padding: 2px 10px; border-radius: 20px;
+    font-size: 0.8em; font-weight: 600; margin-left: 8px;
+  }
+  .badge-green { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.4); }
+  .toc {
+    background: var(--bg-soft); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 24px; margin: 22px 0;
+  }
+  .toc ol { margin: 8px 0; columns: 2; column-gap: 32px; }
+  .toc li { margin: 3px 0; }
+  .warn { color: var(--orange); }
+  .danger { color: var(--red); }
+  .footer {
+    margin-top: 56px; padding-top: 22px; border-top: 1px solid var(--border);
+    color: var(--text-dim); font-size: 0.88em;
+  }
+  @media (max-width: 640px) { .toc ol { columns: 1; } }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <h1>Manual de uso — pxpipe</h1>
+    <p>Proxy local que recorta los tokens de entrada de Claude Code transformando el contenido voluminoso (system prompt, tool docs, historial antiguo) en imágenes PNG densas. <strong>−59 a −70 %</strong> del coste de entrada. El modelo responde con texto; pxpipe solo comprime la <em>petición</em>, nunca la respuesta.</p>
+    <p style="color:var(--text-dim); margin-top:10px;">Modelo objetivo por defecto: <strong>Claude Fable 5</strong> <span class="badge badge-green">akumrazor/pxpipe</span></p>
+  </header>
+
+  <div class="toc">
+    <strong>Contenido</strong>
+    <ol>
+      <li><a href="#req">Requisitos previos</a></li>
+      <li><a href="#inst">Instalación</a></li>
+      <li><a href="#run">Arrancar el proxy</a></li>
+      <li><a href="#connect">Conectar Claude Code</a></li>
+      <li><a href="#dash">Dashboard</a></li>
+      <li><a href="#verify">Verificar compresión</a></li>
+      <li><a href="#env">Variables de entorno</a></li>
+      <li><a href="#live">Control en vivo</a></li>
+      <li><a href="#models">Modelos y alcance</a></li>
+      <li><a href="#subagents">Subagentes</a></li>
+      <li><a href="#export">Modo export</a></li>
+      <li><a href="#trouble">Solución de problemas</a></li>
+      <li><a href="#stop">Detener el proxy</a></li>
+      <li><a href="#cheat">Cheatsheet</a></li>
+    </ol>
+  </div>
+
+  <section id="req">
+    <h2>1. Requisitos previos</h2>
+    <table>
+      <thead><tr><th>Requisito</th><th>Versión / detalle</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Node.js</strong></td><td><code>&gt;= 18</code></td></tr>
+        <tr><td><strong>pnpm</strong></td><td><code>10.21.0</code> (recomendado)</td></tr>
+        <tr><td><strong>Claude Code CLI</strong></td><td>instalado (<code>claude</code> en el PATH)</td></tr>
+        <tr><td><strong>Acceso API</strong></td><td>cuenta Anthropic con clave/oAuth que Claude Code use normalmente</td></tr>
+        <tr><td><strong>SO</strong></td><td>macOS, Linux o Windows</td></tr>
+      </tbody>
+    </table>
+    <blockquote><p>pxpipe <strong>no</strong> necesita tu clave de API: reenvía de forma transparente las cabeceras de auth que envía Claude Code. Solo transforma el cuerpo del request.</p></blockquote>
+    <pre><code>npm install -g pnpm@10.21.0     # si no tienes pnpm</code></pre>
+  </section>
+
+  <section id="inst">
+    <h2>2. Instalación</h2>
+    <h3>A) Desde este repo clonado (recomendado)</h3>
+<pre><code>git clone https://github.com/akumrazor/pxpipe.git
+cd pxpipe
+pnpm install</code></pre>
+    <p>Luego:</p>
+    <ul>
+      <li><strong>Modo dev</strong> (sin build, recarga en caliente): <code>pnpm dev:node</code></li>
+      <li><strong>Build + bin</strong>: <code>pnpm build &amp;&amp; node bin/cli.js</code></li>
+    </ul>
+    <h3>B) Sin clonar (paquete publicado)</h3>
+<pre><code>npx pxpipe-proxy          # arranca el proxy en 127.0.0.1:47821</code></pre>
+    <h3>C) Worker de Cloudflare (opcional)</h3>
+<pre><code>pnpm install &amp;&amp; pnpm build &amp;&amp; pnpm deploy:worker</code></pre>
+  </section>
+
+  <section id="run">
+    <h2>3. Arrancar el proxy</h2>
+<pre><code>cd pxpipe
+pnpm dev:node             # o: pnpm build &amp;&amp; node bin/cli.js</code></pre>
+    <p>Salida esperada:</p>
+<pre><code>[pxpipe] listening on http://127.0.0.1:47821
+[pxpipe] anthropic upstream → https://api.anthropic.com
+[pxpipe] openai upstream → https://api.openai.com
+[pxpipe] tracking events → ~/.pxpipe/events.jsonl
+[pxpipe] dashboard → http://127.0.0.1:47821/</code></pre>
+    <blockquote><p>El CLI <strong>solo</strong> acepta <code>--help</code> y <code>--version</code>. Todo ajuste va por variables de entorno (sección 7).</p></blockquote>
+  </section>
+
+  <section id="connect">
+    <h2>4. Conectar Claude Code</h2>
+    <p>En <strong>otra</strong> terminal (Git Bash):</p>
+<pre><code>ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude</code></pre>
+    <p>Tu clave/oAuth de Anthropic se sigue usando como siempre; pxpipe la reenvía sin tocarla.</p>
+    <h3>Otros shells en Windows</h3>
+<pre><code># PowerShell
+$env:ANTHROPIC_BASE_URL="http://127.0.0.1:47821"; claude
+
+:: cmd.exe
+set ANTHROPIC_BASE_URL=http://127.0.0.1:47821 &amp;&amp; claude</code></pre>
+  </section>
+
+  <section id="dash">
+    <h2>5. Dashboard</h2>
+    <p>Abre <a href="http://127.0.0.1:47821/"><strong>http://127.0.0.1:47821/</strong></a>. Muestra:</p>
+    <ul>
+      <li>Tokens ahorrados y % end-to-end (medido contra un <code>count_tokens</code> gratis por request).</li>
+      <li>Cada conversión texto → imagen, lado a lado.</li>
+      <li><strong>Kill switch</strong> para desactivar la compresión en vivo.</li>
+      <li><strong>Chips de modelo</strong> para activar/desactivar familias.</li>
+      <li>Sesiones, stats y limpieza de logs.</li>
+    </ul>
+    <blockquote><p class="warn">⚠️ El dashboard <strong>no tiene autenticación</strong>. Por defecto el proxy escucha solo en <code>127.0.0.1</code>. No expongas el puerto a la LAN sin más.</p></blockquote>
+  </section>
+
+  <section id="verify">
+    <h2>6. Verificar que está comprimiendo</h2>
+    <p>En la terminal del proxy, una línea por request. Ejemplo de request <strong>comprimida</strong>:</p>
+<pre><code>POST /v1/messages → 200 (1234ms) compressed 48000ch → 2img/91234B (tr+1) tokens=2700+350 cache_read=...</code></pre>
+    <table>
+      <thead><tr><th>Etiqueta</th><th>Qué significa</th></tr></thead>
+      <tbody>
+        <tr><td><code>compressed Nch → Mimg/KB</code></td><td>se convirtió texto a imágenes</td></tr>
+        <tr><td><code>tr+N</code></td><td>N bloques <code>tool_result</code> imageados</td></tr>
+        <tr><td><code>rem+N</code></td><td>N recordatorios imageados</td></tr>
+        <tr><td><code>unsupported_model</code></td><td>modelo fuera del allowlist → pasa como texto</td></tr>
+        <tr><td><code>unsupported_path/method</code></td><td>ruta/método no elegible → pasa intacto</td></tr>
+      </tbody>
+    </table>
+    <p>Eventos en <code>~/.pxpipe/events.jsonl</code>.</p>
+  </section>
+
+  <section id="env">
+    <h2>7. Variables de entorno</h2>
+    <p><code>PXPIPE_MODELS</code> se re-lee por request (cambia en caliente); el resto, al arrancar.</p>
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Para qué</th></tr></thead>
+      <tbody>
+        <tr><td><code>PORT</code></td><td><code>47821</code></td><td>Puerto de escucha</td></tr>
+        <tr><td><code>HOST</code></td><td><code>127.0.0.1</code></td><td>Interfaz (<code>0.0.0.0</code> = expuesto ⚠️)</td></tr>
+        <tr><td><code>ANTHROPIC_UPSTREAM</code></td><td><code>https://api.anthropic.com</code></td><td>Base URL upstream Anthropic</td></tr>
+        <tr><td><code>OPENAI_UPSTREAM</code></td><td><code>https://api.openai.com</code></td><td>Base URL upstream OpenAI</td></tr>
+        <tr><td><code>OPENAI_API_KEY</code></td><td>(reenviada)</td><td>Clave OpenAI opcional</td></tr>
+        <tr><td><code>PXPIPE_UPSTREAM</code></td><td>—</td><td>Base URL común para ambas familias</td></tr>
+        <tr><td><code>PXPIPE_MODELS</code></td><td><code>claude-fable-5,gpt-5.6</code></td><td>Allowlist de modelos (CSV); <code>off</code> desactiva</td></tr>
+        <tr><td><code>PXPIPE_DISABLE</code></td><td>(off)</td><td><code>1</code> = passthrough total</td></tr>
+        <tr><td><code>PXPIPE_LOG</code></td><td><code>~/.pxpipe/events.jsonl</code></td><td>Ruta del log JSONL</td></tr>
+        <tr><td><code>PXPIPE_CONFIG</code></td><td><code>~/.config/pxpipe/config.json</code></td><td>Config JSON (<code>{"models": [...]}</code>)</td></tr>
+        <tr><td><code>PXPIPE_DUMP_DIR</code></td><td>(off)</td><td>Carpeta para volcar cada PNG renderizado</td></tr>
+        <tr><td><code>PXPIPE_PROVIDER</code></td><td>—</td><td><code>cloudflare-ai-gateway</code></td></tr>
+        <tr><td><code>PXPIPE_GATEWAY_BASE_URL</code></td><td>—</td><td>URL del gateway</td></tr>
+        <tr><td><code>PXPIPE_GATEWAY_HEADERS</code></td><td>—</td><td>Cabeceras extra (JSON o <code>k=v;k2=v2</code>)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="live">
+    <h2>8. Control en vivo</h2>
+    <ul>
+      <li><strong>Compresión on/off:</strong> botón <em>kill switch</em> del dashboard, o <code>PXPIPE_DISABLE=1</code>.</li>
+      <li><strong>Modelos imageados:</strong> chips del dashboard, o <code>PXPIPE_MODELS</code> (re-leído por request).</li>
+      <li><strong>Desactivar todo:</strong> <code>PXPIPE_MODELS=off</code>.</li>
+    </ul>
+    <p>Lo que no esté en el allowlist pasa <strong>byte-identical</strong> como texto. La decisión se toma <strong>por request individual</strong>, mirando el campo <code>model</code>.</p>
+  </section>
+
+  <section id="models">
+    <h2>9. Modelos soportados y alcance</h2>
+    <p><strong>Se imagean por defecto:</strong> <code>claude-fable-5</code>, <code>gpt-5.6</code>.</p>
+    <p><strong>Opt-in (lectores peores, añadir a <code>PXPIPE_MODELS</code>):</strong> <code>claude-opus-4-7/4-8</code> (fallos silenciosos en strings exactos), <code>gpt-5.5</code> (degradación con contexto imageado).</p>
+    <p><strong>Qué se comprime</strong> (cada bloque, tras puerta de rentabilidad):</p>
+    <ol>
+      <li>Bloques grandes de <code>tool_result</code> (&gt; ~6k chars densos).</li>
+      <li>Historial antiguo colapsado (los turns recientes siempre quedan como texto).</li>
+      <li>El slab estático: system prompt + tool docs.</li>
+    </ol>
+    <p><strong>Nunca se toca:</strong> la salida del modelo, los turns recientes, la prosa dispersa y los bloques pequeños.</p>
+    <blockquote><p>Los tags de variante como <code>[1m]</code> se ignoran antes de comparar: <code>claude-fable-5[1m]</code> se trata como <code>claude-fable-5</code>.</p></blockquote>
+  </section>
+
+  <section id="subagents">
+    <h2>10. Comportamiento con subagentes</h2>
+    <p>El ser Fable del agente principal <strong>no se propaga</strong> a los subagentes. La decisión es <strong>por request, mirando solo el <code>model</code></strong>, sin estado ni árbol de agentes.</p>
+    <table>
+      <thead><tr><th>Request</th><th>¿Se imagea?</th></tr></thead>
+      <tbody>
+        <tr><td>Agente principal en Fable</td><td>✅ Sí</td></tr>
+        <tr><td>Subagente cuyo modelo es Fable</td><td>✅ Sí</td></tr>
+        <tr><td>Subagente en Sonnet / Opus / Haiku</td><td>❌ No (texto)</td></tr>
+        <tr><td>Modelo ilegible</td><td>❌ No (fail-closed)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Escape hatch</strong> para trabajo byte-exacto:</p>
+<pre><code>CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6     # o en el frontmatter: model: sonnet</code></pre>
+  </section>
+
+  <section id="export">
+    <h2>11. Modo export (sin proxy)</h2>
+    <p>Renderiza archivos/diffs a PNG listos para pegar en cualquier chat:</p>
+<pre><code>node bin/cli.js export src/                 # un directorio
+node bin/cli.js export --git                # cambios sin commitear
+node bin/cli.js export --diff HEAD~3        # últimos 3 commits
+node bin/cli.js export --include "*.ts" src # filtrar por glob
+cat file.txt | node bin/cli.js export --stdin
+node bin/cli.js export --help               # todas las opciones</code></pre>
+    <p>Salida en <code>&lt;tmp&gt;/pxpipe-export-XXXXXX/</code>: <code>page-NNN.png</code>, <code>prompt.txt</code>, <code>factsheet.txt</code> (strings verbatim), <code>manifest.json</code>.</p>
+  </section>
+
+  <section id="trouble">
+    <h2>12. Solución de problemas</h2>
+    <p><strong>"Nada se comprime / todo dice <code>unsupported_model</code>"</strong><br>
+    Tu Claude Code usa un modelo fuera del allowlist. Confírmalo en el dashboard o con <code>PXPIPE_MODELS</code>. Para Fable, el modelo debe ser <code>claude-fable-5</code>.</p>
+    <p><strong>Errores 401/403 del upstream</strong><br>
+    pxpipe no añade auth; reenvía la del cliente. Asegúrate de que Claude Code tenga su clave/oAuth. Si usas un gateway propio, apunta <code>ANTHROPIC_UPSTREAM</code>.</p>
+    <p><strong>Puerto ocupado (<code>EADDRINUSE</code>)</strong><br>
+    <code>PORT=5000 pnpm dev:node</code>.</p>
+    <p><strong>"did you forget to <code>npm run build</code>?"</strong><br>
+    Estás corriendo <code>node bin/cli.js</code> sin <code>dist/</code>. Haz <code>pnpm build</code>, o usa <code>pnpm dev:node</code>.</p>
+    <p><strong>Quiero ver qué ve el modelo</strong><br>
+    Arranca con <code>PXPIPE_DUMP_DIR=./dump</code>.</p>
+    <p><strong>El proxy no recibe tráfico</strong><br>
+    Verifica <code>echo $ANTHROPIC_BASE_URL</code> → debe ser <code>http://127.0.0.1:47821</code>, y que el dashboard cargue.</p>
+    <blockquote><p class="danger">⚠️ <strong>¿Es seguro para hashes/IDs/secretos?</strong> <strong>No.</strong> La lectura verbatim de strings exactos en imágenes densas es poco fiable (13/15 en Fable, 0/15 en Opus para hex de 12 chars). Los valores byte-exactos deben ir como texto. Para trabajo crítico, usa el escape hatch de subagentes.</p></blockquote>
+  </section>
+
+  <section id="stop">
+    <h2>13. Detener el proxy</h2>
+    <p><code>Ctrl+C</code> en la terminal del proxy. Cierra limpiamente: flushea el tracker, cierra sockets idle y fuerza el cierre de conexiones en vuelo tras ~1.5 s. Un segundo <code>Ctrl+C</code> sale al momento.</p>
+  </section>
+
+  <section id="cheat">
+    <h2>14. Cheatsheet</h2>
+<pre><code># --- instalación ---
+git clone https://github.com/akumrazor/pxpipe.git &amp;&amp; cd pxpipe
+pnpm install
+
+# --- arrancar ---
+pnpm dev:node                                # o: pnpm build &amp;&amp; node bin/cli.js
+
+# --- conectar Claude Code (otra terminal) ---
+ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
+
+# --- dashboard ---
+# http://127.0.0.1:47821/
+
+# --- parar ---
+# Ctrl+C en la terminal del proxy
+
+# --- export (sin proxy) ---
+node bin/cli.js export --git
+node bin/cli.js export --diff HEAD~3
+
+# --- variables útiles ---
+# PORT=5000 PXPIPE_MODELS=claude-fable-5,gpt-5.6 PXPIPE_DUMP_DIR=./dump pnpm dev:node</code></pre>
+  </section>
+
+  <div class="footer">
+    Manual para el fork <code>akumrazor/pxpipe</code> (upstream <code>teamchong/pxpipe</code>). Este documento <strong>sí</strong> se versiona en el repo (no está en <code>.gitignore</code>), para tenerlo disponible al clonar en otra máquina.
+  </div>
+
+</div>
+</body>
+</html>
