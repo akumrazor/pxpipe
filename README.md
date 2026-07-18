@@ -174,20 +174,20 @@ used for these novel-arithmetic rows.
 | novel arithmetic | `claude-opus-4-8` | 100 | 93% |
 | novel arithmetic | `grok-4.5` | 100 | **82%** |
 | novel arithmetic | `moonshotai/kimi-k3` | 100 | **79%** |
-| gist recall A/B (decisions, values, paths, names, negations; distractors; 15k–45k char sessions) | Fable 5 | 98/arm | **98/98** |
+| gist recall A/B (decisions, values, paths, names, negations; distractors; 15k–45k char sessions) | `claude-fable-5` | 98 | **98/98** |
 | same gist corpus, production images + factsheet | `gpt-5.6-sol` | 98 | **83/98** |
 | same gist corpus, production images + factsheet | `grok-4.5` | 98 | **83/98** |
 | same gist corpus, production images + factsheet | `moonshotai/kimi-k3` | 98 | **84/98** |
-| state tracking (value mutated 3×, final/first/count) | Fable 5 | 18/arm | **18/18** |
+| state tracking (value mutated 3×, final/first/count) | `claude-fable-5` | 18 | **18/18** |
 | same state-tracking corpus | `gpt-5.6-sol` | 18 | **17/18** |
 | same state-tracking corpus | `grok-4.5` | 18 | **13/18** |
 | same state-tracking corpus | `moonshotai/kimi-k3` | 18 | **15/18** |
-| confabulation on never-stated facts (lower is better) | Fable 5 | 16/arm | **0/16** |
+| confabulation on never-stated facts (lower is better) | `claude-fable-5` | 16 | **0/16** |
 | same never-stated probes (lower is better) | `gpt-5.6-sol` | 16 | **4/16** |
 | same never-stated probes (lower is better) | `grok-4.5` | 16 | **0/16** |
 | same never-stated probes (lower is better) | `moonshotai/kimi-k3` | 16 | **1/16** |
-| verbatim 12-char hex, dense render | Opus | 15 | **0/15** |
-| verbatim 12-char hex, dense render | Fable 5 | 15 | **13/15** |
+| verbatim 12-char hex, dense render | `claude-opus-4-8` | 15 | **0/15** |
+| verbatim 12-char hex, dense render | `claude-fable-5` | 15 | **13/15** |
 | verbatim 12-char hex, same dense pages | `gpt-5.6-sol` | 15 | **0/15** |
 | verbatim 12-char hex, same dense pages | `grok-4.5` | 15 | **0/15** |
 | verbatim 12-char hex, same dense pages | `moonshotai/kimi-k3` | 15 | **0/15** |
