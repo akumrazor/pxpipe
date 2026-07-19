@@ -1,10 +1,87 @@
 # FINDINGS — pxpipe (text→PNG token compression)
 
 **Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
-**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact)
-**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09)
-**Model scope (current):** Fable 5 only, enforced in library + proxy (Opus disabled 2026-06-09 — see update below).
-**Harness:** `eval/needle-haystack/` (receipts preserved from `/tmp/needle_eval`)
+**Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot)
+**Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09), `gpt-5.6-sol` (2026-07-09 raw-image pilot)
+**Model scope (current):** Fable 5 only. Sol, Opus, GPT 5.5, and Grok remain explicit opt-ins.
+**Harnesses:** Claude/Opus/Fable: `eval/needle-haystack/` (older receipts preserved from `/tmp/needle_eval`); Sol: `eval/sol-profile/` (raw responses and receipts committed)
+
+---
+
+## Update (2026-07-17) — Sol 5×8 evaluated, remains opt-in
+
+The exact `gpt-5.6-sol` profile now uses Spleen 5×8 at 152 columns. It remains
+an explicit opt-in. Fresh novel arithmetic scored 96/100 pure-image and 98/100
+with the production factsheet. Matched input usage was 5,300 text tokens versus
+7,000 production-image tokens, 32% more on this short workload.
+
+On the portable gist corpus, Sol scored 83/98 answerable probes, 17/18 state
+probes, and 4/16 never-stated confabulations. All sessions completed without
+transport errors. Dense 12-character hex recall scored 0/15.
+
+These results keep Sol below the Fable default bar. Native recent/open state and
+the verbatim factsheet remain required guards. Sibling `gpt-5.6-*` ids do not
+inherit the Sol profile or allowlist.
+
+---
+
+## Update (2026-07-09) — GPT-5.6 Sol fails raw exact recall at both tested profiles; moved to opt-in
+
+The exact production model id is `gpt-5.6-sol`. Production telemetry showed
+that real Sol requests reached the Responses path and retained positive
+estimated savings, but token rows are not reader-quality evidence. A separate
+paid pilot therefore sent deterministic rendered terminal fixtures directly to
+the Responses endpoint with `detail: original`, bypassing pxpipe.
+
+### What was actually tested
+
+Each scored call asked, in one structured response, for four exact values
+(12-character hex, camelCase field, full path, and port), one rollout gist, and
+one deliberately unstated fact. The two profiles were real paid Sol calls:
+
+| profile | dimensions | exact | unsupported inventions | gist | unstated guard | result |
+|---|---:|---:|---:|:---:|:---:|---|
+| JetBrains Mono 10, 6×11, 126 cols | 764×1724 | **0/4** | **4** | pass | pass | **fail** |
+| old shared Spleen, 5×8, 152 cols | 768×1040 | **0/4** | **4** | fail | pass | **fail** |
+
+The 5×8 line is a model result, not a local-render inference and not a reuse of
+Grok's 5×8 result. In both Sol calls every returned hex/id/path/port was absent
+from the fixture, so the errors are classified as confabulations rather than
+single-glyph OCR substitutions.
+
+There was one additional paid setup attempt at 6×11. It returned no answer
+because all 512 output tokens were hidden reasoning tokens and ended
+`incomplete: max_output_tokens`. It counts toward spend but is excluded from
+recall scoring. The corrected scored calls used `reasoning: none`.
+
+### Honest boundary
+
+- This is one scored synthetic fixture per profile because the early-stop rule
+  halted after clear failure. It proves those calls failed the bar; it does not
+  estimate a population error rate.
+- It is **not** a direct Sol-vs-Fable comparison. Fable's evidence comes from
+  separate, larger harnesses described below.
+- Production attaches a deterministic verbatim fact-sheet for extracted paths
+  and identifiers. That text fallback can rescue covered exact strings, but it
+  does not make the raw-image result a pass.
+- A Sol-only JetBrains effective 9×12 / 84-column candidate is rendered locally
+  (two pages, 2,136 estimated image tokens, positive estimated savings) but has
+  **not** received a model call. It is geometry, not evidence.
+
+### Decision
+
+`gpt-5.6-sol` is **off by default**, under the same rule used for GPT 5.5 and
+Grok: silent image rewriting requires positive recall evidence, not merely
+positive savings. Its exact profile and suffix aliases remain available for
+explicit operator opt-in:
+
+    PXPIPE_MODELS=claude-fable-5,gpt-5.6-sol
+
+The larger 2026-07-11 evaluation changed Sol's profile to 5×8, but broader
+recall still kept it opt-in.
+
+Receipts and every raw response:
+[`eval/sol-profile/RESULTS.md`](eval/sol-profile/RESULTS.md).
 
 ---
 

@@ -24,13 +24,17 @@ function baseModelId(model: string): string {
 /** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 (Claude) plus
- *  GPT 5.6. GPT 5.5 and Opus 4.8 are intentionally off — same pipeline but
- *  measurably worse at reading imaged content (FINDINGS.md 2026-06-16: Opus 4.8
- *  ~2pp arithmetic, 6/15 dense-hex recall vs Fable's 100/100; GPT 5.5 likewise
- *  degrades on imaged history/context) — so silently imaging them is the wrong
- *  default. Both stay opt-in via the dashboard chips or PXPIPE_MODELS. */
-const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gpt-5.6'];
+/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5 only.
+ *  Everything else is opt-in via dashboard chips or PXPIPE_MODELS:
+ *  - Opus 4.7/4.8 — worse at reading imaged content (FINDINGS.md 2026-06-16:
+ *    Opus 4.8 ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100).
+ *  - GPT 5.5 — degrades on imaged history/context.
+ *  - GPT 5.6 Sol — 98/100 production arithmetic, but 79/93 completed gist,
+ *    4/15 completed guard confabulations, and 0/15 dense hex.
+ *  - Grok 4.5 — 82/100 arithmetic, 83/98 gist, and 13/18 state tracking.
+ *  Both profiles remain available for explicit opt-in.
+ *  Silently imaging weak or unvalidated readers is the wrong default. */
+const DEFAULT_MODEL_BASES = ['claude-fable-5'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());
@@ -38,9 +42,9 @@ function falsey(v: string): boolean {
 
 /** PXPIPE_MODELS env / built-in default, ignoring the runtime override. One CSV
  *  controls every family (Claude + GPT). Resolution (read per-call so scope flips LIVE):
- *  - unset or empty        → built-in default (Fable 5 + GPT 5.6)
+ *  - unset or empty        → built-in default (Fable 5 only)
  *  - `off`/`0`/`false`/... → compress nothing
- *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6`) */
+ *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6-sol`) */
 function envOrDefaultBases(): string[] {
   // Edge-safe: `process` is undefined off-Node; `typeof` avoids a ReferenceError.
   const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MODELS : undefined;

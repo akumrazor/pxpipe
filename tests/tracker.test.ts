@@ -3,6 +3,19 @@ import { toTrackEvent, JsonLogTracker, noopTracker, type TrackEvent } from '../s
 import type { ProxyEvent } from '../src/core/proxy.js';
 
 describe('toTrackEvent', () => {
+  it('persists bridged accounting semantics and GPT-native overhead', () => {
+    const out = toTrackEvent({
+      method: 'POST', path: '/v1/messages', model: 'gpt-5.6-sol',
+      accountingProvider: 'openai', status: 200, durationMs: 1,
+      info: {
+        compressed: true, origChars: 1, compressedChars: 1, imageCount: 1,
+        imageBytes: 1, staticChars: 1, dynamicChars: 0, dynamicBlockCount: 0,
+        nativeInjectedTokens: 123,
+      },
+    });
+    expect(out.accounting_provider).toBe('openai');
+    expect(out.native_injected_tokens).toBe(123);
+  });
   it('flattens ProxyEvent + TransformInfo + Usage into a single record', () => {
     const ev: ProxyEvent = {
       method: 'POST',
@@ -65,6 +78,34 @@ describe('toTrackEvent', () => {
     expect(out.cache_create_tokens).toBe(0);
     // ts is ISO8601
     expect(out.ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it('persists Responses completed-pair imageability telemetry', () => {
+    const out = toTrackEvent({
+      method: 'POST', path: '/v1/responses', status: 200, durationMs: 1,
+      info: {
+        compressed: true, origChars: 1, compressedChars: 1,
+        imageCount: 1, imageBytes: 1, staticChars: 1, dynamicChars: 0,
+        dynamicBlockCount: 0, droppedChars: 0,
+        responsesComposition: {
+          instructions: 0, systemDeveloper: 0, userAssistant: 1,
+          functionCalls: 100, functionOutputs: 449922, reasoningEncrypted: 0,
+          compactionOpaque: 0, toolsJson: 0, other: 0, totalLocal: 450023,
+          imageParts: 0, completedFunctionPairs: 20, recentNativeFunctionPairs: 6,
+          oldFunctionPairs: 14, openFunctionCalls: 1, orphanFunctionOutputs: 0,
+          malformedFunctionItems: 0, imageableFunctionCalls: 90,
+          imageableFunctionOutputs: 440000, collapsedFunctionPairs: 8,
+          collapsedFunctionCalls: 50, collapsedFunctionOutputs: 250000,
+        },
+      },
+    });
+    expect(out.responses_composition).toMatchObject({
+      functionOutputs: 449922,
+      imageableFunctionOutputs: 440000,
+      collapsedFunctionOutputs: 250000,
+      recentNativeFunctionPairs: 6,
+      openFunctionCalls: 1,
+    });
   });
 
   it('captures the nested cache_creation split and server_tool_use counters', () => {

@@ -14,6 +14,9 @@ import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
 import {
+  chatCompletionsUrl,
+} from './core/messages-chat-bridge.js';
+import {
   parseExportArgv,
   runExportCore,
   type ExportParsed,
@@ -45,10 +48,18 @@ interface RuntimeConfig {
   upstream: string;
   openAIUpstream: string;
   openAIApiKey?: string;
+  /** Independent Cloudflare OpenAI-compatible endpoint. */
+  cloudflareUpstream?: string;
+  cloudflareApiKey?: string;
+  openAIModels?: string[];
+  cloudflareModels?: string[];
   provider?: 'cloudflare-ai-gateway';
   gatewayBaseUrl?: string;
   gatewayHeaders?: Record<string, string>;
   eventsFile: string;
+  /** Persist 4xx request bodies to disk for debugging. Off unless
+   *  PXPIPE_DEBUG_CAPTURE_4XX=1. */
+  captureErrorReqBody: boolean;
 }
 
 const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
@@ -104,6 +115,15 @@ function parseCli(argv: string[]): RuntimeConfig {
   }
   applyConfigFileDefaults();
   const sharedUpstream = process.env.PXPIPE_UPSTREAM;
+  const cfAccount = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+  const cfToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
+  const parseModels = (value: string | undefined): string[] | undefined => {
+    if (value === undefined) return undefined;
+    return value.split(',').map((model) => model.trim()).filter(Boolean);
+  };
+  const cloudflareUpstream = cfAccount && cfToken
+    ? `https://api.cloudflare.com/client/v4/accounts/${cfAccount}/ai/v1`
+    : undefined;
   return {
     port: Number(process.env.PORT ?? 47821),
     // Loopback by default; opt into all-interfaces exposure explicitly via HOST.
@@ -111,12 +131,19 @@ function parseCli(argv: string[]): RuntimeConfig {
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
     openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
     openAIApiKey: process.env.OPENAI_API_KEY,
+    cloudflareUpstream,
+    cloudflareApiKey: cfToken,
+    openAIModels: parseModels(process.env.OPENAI_MODELS),
+    cloudflareModels: parseModels(process.env.CLOUDFLARE_MODELS),
     provider: parseProvider(process.env.PXPIPE_PROVIDER),
     gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
     gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
     eventsFile:
       process.env.PXPIPE_LOG ??
       path.join(os.homedir(), '.pxpipe', 'events.jsonl'),
+    // Off by default: 4xx request bodies hold full prompts + any secrets in
+    // context. Opt in for debugging only. (issue #69)
+    captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
   };
 }
 
@@ -156,17 +183,26 @@ Environment:
   OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
                            (default https://api.openai.com)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
+  OPENAI_MODELS           comma-separated exact model ids routed to OpenAI
+                          Responses
+  CLOUDFLARE_MODELS       comma-separated exact model ids routed to Cloudflare
+  CLOUDFLARE_ACCOUNT_ID   with CLOUDFLARE_API_TOKEN, zero-config Cloudflare
+  CLOUDFLARE_API_TOKEN    Workers AI endpoint and bearer token
   PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
                           families through one gateway base URL
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
   PXPIPE_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
-  PXPIPE_MODELS           comma-separated model bases to image (Claude + GPT);
-                          default claude-fable-5,gpt-5.6; off disables
+  PXPIPE_MODELS           comma-separated model bases to image (Claude/GPT/Grok);
+                          default claude-fable-5 (Sol/Opus/GPT-5.5/Grok opt-in);
+                          off disables
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
   PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
+  PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request bodies
+                          (prompts + any secrets in context) to disk. Off by
+                          default; on-disk telemetry keeps only hashes.
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -253,12 +289,38 @@ function isConnectionAbort(err: unknown): boolean {
     causeMessage.includes('other side closed');
 }
 
-async function waitForDrain(out: ServerResponse): Promise<void> {
-  const event = await Promise.race([
-    once(out, 'drain').then(() => 'drain'),
-    once(out, 'close').then(() => 'close'),
-  ]);
-  if (event === 'close') throw new Error('client response closed');
+function waitForDrain(out: ServerResponse): Promise<void> {
+  // Do NOT use Promise.race([once(out,'drain'), once(out,'close')]): the losing
+  // once() never detaches its listener, and events.once() also attaches an
+  // implicit 'error' listener. On a long streamed response every backpressure
+  // cycle would then leak one 'close' + one 'error' listener on the same
+  // ServerResponse, triggering MaxListenersExceededWarning, unbounded heap
+  // growth, and eventually a silent OOM exit of the proxy. Manage the listeners
+  // manually and remove all of them on whichever event fires first. 'error' must
+  // be handled too: with no 'error' listener attached, an error emitted while we
+  // wait would crash the process as an unhandled 'error' event.
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      out.off('drain', onDrain);
+      out.off('close', onClose);
+      out.off('error', onError);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error('client response closed'));
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+    out.once('drain', onDrain);
+    out.once('close', onClose);
+    out.once('error', onError);
+  });
 }
 
 async function writeWebResponse(res: Response, out: ServerResponse): Promise<void> {
@@ -379,26 +441,31 @@ async function dispatchDashboard(
         dashboard.handleCompressionToggle({ enabled });
         return dashboard.serveFragment('toggle', url, port);
       }
-      // /fragments/models POSTs one chip flip: {model, on}. Server mutates the
-      // runtime compress scope and returns the re-rendered chip row.
+      // /fragments/models POSTs one chip flip {model, on}, or a whole-scope
+      // rewrite {list: "csv"} from the PXPIPE_MODELS textbox. Server mutates
+      // the runtime compress scope and returns the re-rendered rows.
       if (route.name === 'models' && method === 'POST') {
         let model = '';
         let on = false;
+        let list: string | null = null;
         try {
           const raw = await readRequestBody(req);
           try {
-            const j = JSON.parse(raw) as { model?: unknown; on?: unknown };
+            const j = JSON.parse(raw) as { model?: unknown; on?: unknown; list?: unknown };
             model = typeof j.model === 'string' ? j.model : '';
             on = j.on === true;
+            if (typeof j.list === 'string') list = j.list;
           } catch {
             const p = new URLSearchParams(raw);
             model = p.get('model') ?? '';
             on = p.get('on') === 'true';
+            list = p.get('list');
           }
         } catch {
           return new Response('bad request body', { status: 400 });
         }
-        if (model) dashboard.handleModelsToggle(model, on);
+        if (list !== null) dashboard.handleModelsSet(list);
+        else if (model) dashboard.handleModelsToggle(model, on);
         return dashboard.serveFragment('models', url, port);
       }
       if (method !== 'GET') return undefined;
@@ -932,6 +999,11 @@ async function main(): Promise<void> {
     upstream: opts.upstream,
     openAIUpstream: opts.openAIUpstream,
     openAIApiKey: opts.openAIApiKey,
+    cloudflareUpstream: opts.cloudflareUpstream,
+    cloudflareApiKey: opts.cloudflareApiKey,
+    openAIModels: opts.openAIModels,
+    cloudflareModels: opts.cloudflareModels,
+    captureErrorReqBody: opts.captureErrorReqBody,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -976,7 +1048,9 @@ async function main(): Promise<void> {
       const extraTag = extra.length > 0 ? ` (${extra.join(' ')})` : '';
       const tag = e.info?.compressed
         ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B${extraTag}`
-        : (e.info?.reason ?? '');
+        : e.info?.reason
+          ? `savings:skip(${e.info.reason})`
+          : '';
       const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
       const inputTokens = e.usage?.input_tokens ?? 0;
       const usageTag =
@@ -1070,8 +1144,20 @@ async function main(): Promise<void> {
     const routes = resolveUpstreams(config);
     console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);
     console.log(`[pxpipe] openai upstream → ${routes.openai}`);
+    if (opts.cloudflareUpstream !== undefined) {
+      console.log(
+        `[pxpipe] cloudflare upstream → ${chatCompletionsUrl(opts.cloudflareUpstream)} ` +
+          `(models: ${opts.cloudflareModels?.join(', ') || 'none'})`,
+      );
+    }
     console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
     console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
+    if (opts.captureErrorReqBody) {
+      console.warn(
+        `[pxpipe] PXPIPE_DEBUG_CAPTURE_4XX=1 — persisting full 4xx request bodies ` +
+          `(prompts + any secrets in context) to ${bodySidecarDir}. Debugging only.`,
+      );
+    }
   });
 
   // server.close() only stops accepting new connections and waits for open

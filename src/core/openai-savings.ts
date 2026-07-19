@@ -17,6 +17,8 @@
  * premium like Anthropic's ephemeral cache.
  */
 
+import { CACHE_READ_RATE } from './baseline.js';
+
 /** gpt-5 cached input list ratio: $0.125 / $1.25 per 1M tokens. */
 export const OPENAI_GPT5_CACHE_READ_RATE = 0.1;
 
@@ -26,14 +28,27 @@ export const OPENAI_GPT5_OUTPUT_RATE = 8;
 /** Older OpenAI families use a less aggressive cached-input discount. pxpipe's
  * GPT compression gate is currently gpt-5.x-only, but keep the helper explicit
  * so passthrough telemetry does not accidentally get priced at Anthropic rates. */
+/** Grok cached prompt list ratio from xAI model pricing metadata
+ *  (cachedPromptTokenPrice / promptTextTokenPrice = 5000/20000). */
+export const GROK_CACHE_READ_RATE = 0.25;
+
+/** Grok completion/input list ratio (completionTextTokenPrice / promptTextTokenPrice
+ *  = 60000/20000). */
+export const GROK_OUTPUT_RATE = 3;
+
 export function openAICacheReadRate(model: string | undefined): number {
   const m = (model ?? '').toLowerCase();
+  // Model-based rates on the shared Responses path (several families share /v1/responses).
+  if (m.startsWith('claude') || m.includes('anthropic')) return CACHE_READ_RATE;
+  if (m.startsWith('grok-')) return GROK_CACHE_READ_RATE;
   if (/^gpt-5/.test(m)) return OPENAI_GPT5_CACHE_READ_RATE;
   return 0.5;
 }
 
 export function openAIOutputRate(model: string | undefined): number {
   const m = (model ?? '').toLowerCase();
+  if (m.startsWith('claude') || m.includes('anthropic')) return 5;
+  if (m.startsWith('grok-')) return GROK_OUTPUT_RATE;
   if (/^gpt-5/.test(m)) return OPENAI_GPT5_OUTPUT_RATE;
   // Good-enough fallback for non-compressed OpenAI rows; they normally do not
   // enter the savings numerator, but the all-usage denominator should still be
@@ -60,10 +75,11 @@ export function computeOpenAIBaselineRawTokens(
   inputTokens: number,
   imageTokens: number,
   baselineImagedTokens: number,
+  nativeInjectedTokens: number = 0,
 ): number {
   if (inputTokens <= 0) return 0;
   const delta = (baselineImagedTokens || 0) - (imageTokens || 0);
-  return Math.max(0, inputTokens + delta);
+  return Math.max(0, inputTokens + delta - Math.max(0, nativeInjectedTokens || 0));
 }
 
 /** Weighted input tokens for the unproxied GPT text counterfactual.
@@ -81,10 +97,13 @@ export function computeOpenAIBaselineInputEff(
   imageTokens: number,
   baselineImagedTokens: number,
   model?: string,
+  nativeInjectedTokens: number = 0,
 ): number {
   const actual = computeOpenAIActualInputEff(inputTokens, cachedTokens, model);
   if (inputTokens <= 0 || imageTokens <= 0 || baselineImagedTokens <= 0) return actual;
   const delta = baselineImagedTokens - imageTokens;
   const deltaWeight = (cachedTokens || 0) > 0 ? openAICacheReadRate(model) : 1.0;
-  return actual + delta * deltaWeight;
+  // Synthetic native text occupies the same stable prefix as the images, so
+  // apply the same observed cache weight as the replacement delta.
+  return actual + (delta - Math.max(0, nativeInjectedTokens || 0)) * deltaWeight;
 }

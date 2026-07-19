@@ -24,6 +24,10 @@ export interface Env {
   OPENAI_UPSTREAM?: string;
   /** Optional override — if set, replaces whatever Authorization the client sent. */
   OPENAI_API_KEY?: string;
+  OPENAI_MODELS?: string;
+  CLOUDFLARE_MODELS?: string;
+  CLOUDFLARE_ACCOUNT_ID?: string;
+  CLOUDFLARE_API_TOKEN?: string;
   COMPRESS?: string;
   COMPRESS_TOOLS?: string;
   COMPRESS_REMINDERS?: string;
@@ -71,7 +75,7 @@ export default {
     // If this deployment injects API keys, never serve anonymous callers:
     // workers.dev URLs are discoverable, and without this gate anyone who
     // finds the URL spends this deployment's API credits.
-    if (env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY) {
+    if (env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.CLOUDFLARE_API_TOKEN) {
       if (!env.PXPIPE_WORKER_SECRET) {
         return new Response(
           JSON.stringify({
@@ -108,7 +112,9 @@ export default {
       // (e.g. MIN_TOOL_RESULT_CHARS=200 to skip absurdly small dumps).
       minReminderChars: env.MIN_REMINDER_CHARS ? Number(env.MIN_REMINDER_CHARS) : 0,
       minToolResultChars: env.MIN_TOOL_RESULT_CHARS ? Number(env.MIN_TOOL_RESULT_CHARS) : 0,
-      cols: env.COLS ? Number(env.COLS) : 100,
+      // Omit by default so OpenAI-shaped requests use their exact model profile;
+      // COLS remains an explicit operator override for every family.
+      ...(env.COLS ? { cols: Number(env.COLS) } : {}),
       // R2 multi-column ON (2 cols) — single-col drops below break-even on
       // real tool-doc slabs. Override via MULTI_COL=1 if OCR misreads layout.
       multiCol: env.MULTI_COL ? Math.max(1, Number(env.MULTI_COL) | 0) : 2,
@@ -120,18 +126,31 @@ export default {
     const tracker: Tracker = trackingOn ? new JsonLogTracker((s) => console.log(s)) : noopTracker;
 
     const sharedUpstream = env.PXPIPE_UPSTREAM;
+    const parseModels = (value: string | undefined): string[] | undefined =>
+      value === undefined ? undefined : value.split(',').map((model) => model.trim()).filter(Boolean);
+    const cfAccount = env.CLOUDFLARE_ACCOUNT_ID?.trim();
+    const cfToken = env.CLOUDFLARE_API_TOKEN?.trim();
+    const cloudflareUpstream = cfAccount && cfToken
+      ? `https://api.cloudflare.com/client/v4/accounts/${cfAccount}/ai/v1`
+      : undefined;
     const config: ProxyConfig = {
       upstream: env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
       apiKey: env.ANTHROPIC_API_KEY,
       openAIUpstream: env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
       openAIApiKey: env.OPENAI_API_KEY,
+      cloudflareUpstream,
+      cloudflareApiKey: cfToken,
+      openAIModels: parseModels(env.OPENAI_MODELS),
+      cloudflareModels: parseModels(env.CLOUDFLARE_MODELS),
       transform,
       onRequest: (e) => {
         // Terse human-readable line (separate from the JSON event below;
         // shows up in `wrangler tail`).
         const tag = e.info?.compressed
           ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B`
-          : (e.info?.reason ?? '');
+          : e.info?.reason
+            ? `savings:skip(${e.info.reason})`
+            : '';
         const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
         console.log(`${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag} cache_read=${cacheRead}`);
 

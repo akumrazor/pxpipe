@@ -33,8 +33,8 @@ import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
 import {
-  computeActualInputEff,
-  computeBaselineInputEff,
+  computeActualInputEffWithCacheTier,
+  computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
 } from './core/baseline.js';
 import {
@@ -71,6 +71,7 @@ import {
 import {
   getAllowedModelBases,
   getConfiguredModelBases,
+  isPxpipeSupportedModel,
   setAllowedModelBases,
 } from './core/applicability.js';
 import type {
@@ -166,10 +167,10 @@ export interface RecentRow {
  *      cache_read>0 ⇒ a warm cache existed for both paths; cache_read===0 ⇒ cold
  *      for both, so text re-creates its prefix too (no phantom warm read on a
  *      cold turn — that would fabricate a loss out of a real token win):
- *        warm:  baseline_input_eff = reused×0.10 + grown×1.25 + cold_tail×1.0
+ *        warm:  baseline_input_eff = reused×0.10 + grown×observed_create_rate + cold_tail×1.0
  *               where reused = min(prevCacheable, cacheable), grown = cacheable − reused
- *        cold:  baseline_input_eff = cacheable×1.25 + cold_tail×1.0
- *      actual_input_eff   = input + cache_create×1.25 + cache_read×0.10
+ *        cold:  baseline_input_eff = cacheable×observed_create_rate + cold_tail×1.0
+ *      actual_input_eff   = input + cache_create_5m×1.25 + cache_create_1h×2 + cache_read×0.10
  *      output_equiv       = output × 5                (input-token-equivalent at the 5× output rate)
  *      saved              = baseline_input_eff − actual_input_eff
  *      baseline_total     = baseline_input_eff + output_equiv
@@ -300,6 +301,32 @@ interface Totals {
   startedAt: number;
 }
 
+function emptyTotals(startedAt = Date.now() / 1000): Totals {
+  return {
+    requests: 0,
+    compressedRequests: 0,
+    actualInputWeighted: 0,
+    baselineInputWeighted: 0,
+    outputWeighted: 0,
+    allBaselineEquivalentWeighted: 0,
+    allActualInputWeighted: 0,
+    allOutputWeighted: 0,
+    allUsageRequests: 0,
+    compressedPaidRequests: 0,
+    compressedActualInputWeighted: 0,
+    compressedOutputWeighted: 0,
+    passthroughPaidRequests: 0,
+    passthroughActualInputWeighted: 0,
+    passthroughOutputWeighted: 0,
+    textCharsMeasured: 0,
+    thinkingCharsMeasured: 0,
+    toolUseCharsMeasured: 0,
+    redactedBlockCountMeasured: 0,
+    eventsWithMeasurement: 0,
+    startedAt,
+  };
+}
+
 /*
  * ─────────────────────────────────────────────────────────────────────────
  *  PROVENANCE — every magic number below should trace to one of these:
@@ -349,7 +376,11 @@ export const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
  *  model (vision-token imaging, automatic 0.1× prefix cache, no count_tokens
  *  probe, 8× output); everything else uses the Anthropic cache-aware baseline.
  *  Anthropic paths are `/v1/messages[/count_tokens]`; neither word appears. */
-function isOpenAIEvent(path: string | undefined): boolean {
+function isOpenAIEvent(
+  path: string | undefined,
+  accountingProvider?: 'anthropic' | 'openai',
+): boolean {
+  if (accountingProvider) return accountingProvider === 'openai';
   if (!path) return false;
   return path.includes('responses') || path.includes('chat/completions');
 }
@@ -372,6 +403,7 @@ function gptEff(args: {
   cachedTokens: number;
   imageTokens: number;
   baselineImagedTokens: number;
+  nativeInjectedTokens: number;
   compressed: boolean;
 }): {
   haveUsage: boolean;
@@ -384,7 +416,7 @@ function gptEff(args: {
   rawBaseline: number;
 } {
   const { model, inputTokens: inp, outputTokens: out, cachedTokens: cached } = args;
-  const { imageTokens, baselineImagedTokens, compressed } = args;
+  const { imageTokens, baselineImagedTokens, nativeInjectedTokens, compressed } = args;
   const haveUsage = inp > 0 || out > 0;
   // The transform measured what the imaged content would have cost as o200k
   // text; without it there is no counterfactual to credit.
@@ -392,13 +424,17 @@ function gptEff(args: {
   const actualInputEff = haveUsage ? computeOpenAIActualInputEff(inp, cached, model) : 0;
   const creditSaving = haveBaseline && haveUsage && compressed;
   const baselineInputEff = creditSaving
-    ? computeOpenAIBaselineInputEff(inp, cached, imageTokens, baselineImagedTokens, model)
+    ? computeOpenAIBaselineInputEff(
+        inp, cached, imageTokens, baselineImagedTokens, model, nativeInjectedTokens,
+      )
     : actualInputEff;
   const outputEquiv = haveUsage ? out * openAIOutputRate(model) : 0;
   // Raw, rate-free token counts for the session's compression ratio and the
   // Details panel: actual = what we sent; baseline = the text-only equivalent.
   const rawActual = inp;
-  const rawBaseline = computeOpenAIBaselineRawTokens(inp, imageTokens, baselineImagedTokens);
+  const rawBaseline = computeOpenAIBaselineRawTokens(
+    inp, imageTokens, baselineImagedTokens, nativeInjectedTokens,
+  );
   return {
     haveUsage,
     haveBaseline,
@@ -435,29 +471,11 @@ export class DashboardState {
    *  long-running deployments. 50 sessions × ~13 numeric fields each is
    *  comfortably under a MB even with fat bucket/passthrough histograms. */
   private static readonly SESSION_CAP = 50;
-  private totals: Totals = {
-    requests: 0,
-    compressedRequests: 0,
-    actualInputWeighted: 0,
-    baselineInputWeighted: 0,
-    outputWeighted: 0,
-    allBaselineEquivalentWeighted: 0,
-    allActualInputWeighted: 0,
-    allOutputWeighted: 0,
-    allUsageRequests: 0,
-    compressedPaidRequests: 0,
-    compressedActualInputWeighted: 0,
-    compressedOutputWeighted: 0,
-    passthroughPaidRequests: 0,
-    passthroughActualInputWeighted: 0,
-    passthroughOutputWeighted: 0,
-    textCharsMeasured: 0,
-    thinkingCharsMeasured: 0,
-    toolUseCharsMeasured: 0,
-    redactedBlockCountMeasured: 0,
-    eventsWithMeasurement: 0,
-    startedAt: Date.now() / 1000,
-  };
+  private readonly startedAt = Date.now() / 1000;
+  /** Lifetime accounting partitioned by exact model id. The dashboard sums
+   * only currently enabled model families, so toggling a model updates the
+   * overall numbers without discarding its history. */
+  private readonly totalsByModel = new Map<string, Totals>();
   /** Bounded ring of the most recently rendered images (last IMAGE_RING_CAP).
    *  Each request that rendered an image pushes one entry; the matching
    *  RecentRow carries `img_id` so the dashboard can pull any image still in
@@ -476,8 +494,9 @@ export class DashboardState {
    *  renders at 100/100 (no Opus read tax) with the same image billing, and
    *  the live proxy record measured ~68% real input-token savings on dense
    *  traffic — the old off-default rationale ("cache-illusory savings")
-   *  cited the superseded dead verdict. Verbatim recall is still lossy;
-   *  the dashboard toggle remains the kill switch. See FINDINGS.md. */
+   *  cited the superseded dead verdict. Grok stays opt-in until quality
+   *  matches Fable. Verbatim recall is still lossy; the dashboard toggle
+   *  remains the kill switch. See FINDINGS.md. */
   private compressionEnabled = true;
   /** Recent requests' transform breakdowns, for the Context Map panel + its
    *  history selector. In-memory ring, newest last. */
@@ -507,6 +526,27 @@ export class DashboardState {
     this.ccMapFn = ccMapFn ?? (() => claudeCodeMap());
   }
 
+  private totalsForModel(model: string | undefined): Totals {
+    const key = model ?? '';
+    let totals = this.totalsByModel.get(key);
+    if (!totals) {
+      totals = emptyTotals(this.startedAt);
+      this.totalsByModel.set(key, totals);
+    }
+    return totals;
+  }
+
+  private enabledTotals(): Totals {
+    const combined = emptyTotals(this.startedAt);
+    for (const [model, totals] of this.totalsByModel) {
+      if (!isPxpipeSupportedModel(model)) continue;
+      for (const key of Object.keys(combined) as Array<keyof Totals>) {
+        if (key !== 'startedAt') combined[key] += totals[key];
+      }
+    }
+    return combined;
+  }
+
   /** Stash every rendered image into the ring (called from onRequest with the
    *  raw ProxyEvent before info.firstImagePng is dropped by toTrackEvent).
    *  Returns the assigned image ids in render order; empty array when there
@@ -534,7 +574,7 @@ export class DashboardState {
         width,
         height,
         ts: Date.now() / 1000,
-        sourceText: info.imageSourceText,
+        sourceText: info.imageSourceTexts?.[i] ?? info.imageSourceText,
       });
       ids.push(id);
     }
@@ -562,12 +602,15 @@ export class DashboardState {
     const u = ev.usage;
     const info = ev.info;
     const compressed = info?.compressed === true;
+    const totals = this.totalsForModel(ev.model);
 
     const inp = u?.input_tokens ?? 0;
     const out = u?.output_tokens ?? 0;
     const cc = u?.cache_creation_input_tokens ?? 0;
+    const cc5m = u?.cache_creation?.ephemeral_5m_input_tokens;
+    const cc1h = u?.cache_creation?.ephemeral_1h_input_tokens ?? 0;
     const cr = u?.cache_read_input_tokens ?? 0;
-    const gpt = isOpenAIEvent(ev.path);
+    const gpt = isOpenAIEvent(ev.path, ev.accountingProvider);
 
     // Unified per-row accounting, filled by the provider branch below. The
     // downstream totals / per-session / recent-row code reads only these —
@@ -596,6 +639,7 @@ export class DashboardState {
         cachedTokens: u?.cached_tokens ?? 0,
         imageTokens: info?.imageTokens ?? 0,
         baselineImagedTokens: info?.baselineImagedTokens ?? 0,
+        nativeInjectedTokens: info?.nativeInjectedTokens ?? 0,
         compressed,
       });
       haveUsage = e.haveUsage;
@@ -629,7 +673,9 @@ export class DashboardState {
       haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
 
       // Weighted INPUT cost we actually paid this turn.
-      actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+      actualInputEff = haveUsage
+        ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m)
+        : 0;
 
       // pxpipe only reduces input by imaging the static slab. An UNCOMPRESSED
       // row had its body forwarded untouched, so its unproxied counterfactual
@@ -668,7 +714,7 @@ export class DashboardState {
         prefixShaNow,
       );
       baselineInputEff = creditSaving
-        ? computeBaselineInputEff(
+        ? computeBaselineInputEffWithCacheTier(
             baseline as number,
             cacheable,
             inp,
@@ -676,6 +722,8 @@ export class DashboardState {
             cr,
             warm,
             prevCacheable,
+            cc1h,
+            cc5m,
           )
         : actualInputEff;
       // Record this completed turn's prefix size for future cr>0 split estimates.
@@ -727,9 +775,15 @@ export class DashboardState {
         warm: warmForRow,
         output: out,
         imageCount: info.imageCount ?? 0,
+        baselineImagedTokens: info.baselineImagedTokens,
         buckets: { ...(info.bucketChars ?? {}) },
         imageIds: [...imgIds],
         compressed,
+        model: ev.model,
+        responsesComposition: info.responsesComposition,
+        responsesUnexplainedTokens: info.responsesComposition
+          ? Math.max(0, rawBaseline - info.responsesComposition.totalLocal)
+          : undefined,
       });
       // Keep in lockstep with RECENT_CAP so every "view" link in the recent
       // table resolves to a real breakdown (was 30 < 50, so older visible rows
@@ -739,16 +793,16 @@ export class DashboardState {
       }
     }
 
-    this.totals.requests += 1;
-    if (compressed) this.totals.compressedRequests += 1;
+    totals.requests += 1;
+    if (compressed) totals.compressedRequests += 1;
 
     // Measured headline: only compressed rows with a usable probe. An
     // uncompressed row contributes zero saved (baseline === actual), so
     // including it here would only dilute the "saved on rows we moved" %.
     if (creditSaving) {
-      this.totals.baselineInputWeighted += baselineInputEff;
-      this.totals.actualInputWeighted += actualInputEff;
-      this.totals.outputWeighted += outputEquiv;
+      totals.baselineInputWeighted += baselineInputEff;
+      totals.actualInputWeighted += actualInputEff;
+      totals.outputWeighted += outputEquiv;
     }
     // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
     // denominator for "did pxpipe move my real bill". Measured rows
@@ -761,10 +815,10 @@ export class DashboardState {
     if (haveUsage) {
       // baselineInputEff already folds the uncompressed/probe-failed fallback
       // to actualInputEff, so passthrough rows contribute zero saved here.
-      this.totals.allBaselineEquivalentWeighted += baselineInputEff;
-      this.totals.allActualInputWeighted += actualInputEff;
-      this.totals.allOutputWeighted += outputEquiv;
-      this.totals.allUsageRequests += 1;
+      totals.allBaselineEquivalentWeighted += baselineInputEff;
+      totals.allActualInputWeighted += actualInputEff;
+      totals.allOutputWeighted += outputEquiv;
+      totals.allUsageRequests += 1;
       // Direct observed compressed-vs-passthrough split. No counterfactual,
       // no probe gating — just partition the paid-rows set by which path
       // actually ran this turn. Headline answers "is the compressed path
@@ -772,13 +826,13 @@ export class DashboardState {
       // routes each turn) is real; sample counts go to the UI so the
       // operator can judge sufficiency.
       if (compressed) {
-        this.totals.compressedPaidRequests += 1;
-        this.totals.compressedActualInputWeighted += actualInputEff;
-        this.totals.compressedOutputWeighted += outputEquiv;
+        totals.compressedPaidRequests += 1;
+        totals.compressedActualInputWeighted += actualInputEff;
+        totals.compressedOutputWeighted += outputEquiv;
       } else {
-        this.totals.passthroughPaidRequests += 1;
-        this.totals.passthroughActualInputWeighted += actualInputEff;
-        this.totals.passthroughOutputWeighted += outputEquiv;
+        totals.passthroughPaidRequests += 1;
+        totals.passthroughActualInputWeighted += actualInputEff;
+        totals.passthroughOutputWeighted += outputEquiv;
       }
     }
 
@@ -845,11 +899,11 @@ export class DashboardState {
     // content-types; we count an event as "measured" when it has any.
     const m = ev.measurement;
     if (m) {
-      this.totals.textCharsMeasured += m.textChars;
-      this.totals.thinkingCharsMeasured += m.thinkingChars;
-      this.totals.toolUseCharsMeasured += m.toolUseChars;
-      this.totals.redactedBlockCountMeasured += m.redactedBlockCount;
-      this.totals.eventsWithMeasurement += 1;
+      totals.textCharsMeasured += m.textChars;
+      totals.thinkingCharsMeasured += m.thinkingChars;
+      totals.toolUseCharsMeasured += m.toolUseChars;
+      totals.redactedBlockCountMeasured += m.redactedBlockCount;
+      totals.eventsWithMeasurement += 1;
     }
 
     const row: RecentRow = {
@@ -905,9 +959,11 @@ export class DashboardState {
       const inp = t.input_tokens ?? 0;
       const out = t.output_tokens ?? 0;
       const cc = t.cache_create_tokens ?? 0;
+      const cc5m = t.cache_create_5m_tokens;
+      const cc1h = t.cache_create_1h_tokens ?? 0;
       const cr = t.cache_read_tokens ?? 0;
       const compressed = t.compressed === true;
-      const gpt = isOpenAIEvent(t.path);
+      const gpt = isOpenAIEvent(t.path, t.accounting_provider);
 
       // Same unified accounting as update(); see the branch comments there.
       let haveUsage: boolean;
@@ -930,6 +986,8 @@ export class DashboardState {
           imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
           baselineImagedTokens:
             (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
+          nativeInjectedTokens:
+            (t as { native_injected_tokens?: number }).native_injected_tokens ?? 0,
           compressed,
         });
         haveUsage = e.haveUsage;
@@ -953,7 +1011,9 @@ export class DashboardState {
         const probeOk = probeStatus === 'ok'
           || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
         haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
-        actualInputEff = haveUsage ? computeActualInputEff(inp, cc, cr) : 0;
+        actualInputEff = haveUsage
+          ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m)
+          : 0;
         // Mirror update(): only credit the cache-modeled counterfactual on
         // compressed rows. Uncompressed/passthrough rows fall back to the
         // actual cost so they show zero saved (no fabricated savings).
@@ -977,7 +1037,7 @@ export class DashboardState {
           prefixShaR,
         );
         baselineInputEff = creditSaving
-          ? computeBaselineInputEff(
+          ? computeBaselineInputEffWithCacheTier(
               baseline as number,
               cacheable,
               inp,
@@ -985,6 +1045,8 @@ export class DashboardState {
               cr,
               warmR,
               prevCacheableR,
+              cc1h,
+              cc5m,
             )
           : actualInputEff;
         if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {
@@ -1024,9 +1086,15 @@ export class DashboardState {
           warm: warmForRow,
           output: out,
           imageCount,
+          baselineImagedTokens: (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens,
           buckets: { ...((t as { bucket_chars?: Record<string, number> }).bucket_chars ?? {}) },
           imageIds: [], // PNG ring is in-memory; not restorable across restart
           compressed,
+          model: t.model,
+          responsesComposition: (t as { responses_composition?: ContextMapData['responsesComposition'] }).responses_composition,
+          responsesUnexplainedTokens: (t as { responses_composition?: ContextMapData['responsesComposition'] }).responses_composition
+            ? Math.max(0, rawBaseline - ((t as { responses_composition?: ContextMapData['responsesComposition'] }).responses_composition?.totalLocal ?? 0))
+            : undefined,
           restored: true,
         });
         if (this.contextHistory.length > RECENT_CAP) {
@@ -1125,9 +1193,10 @@ export class DashboardState {
     //     What Anthropic's weekly limit actually meters — input × 1.0 +
     //     output × 5.0 (the same ratio as the per-MTok price card). This is
     //     the number that moves your "%% used this week" indicator.
-    const baseline = this.totals.baselineInputWeighted;
-    const actual = this.totals.actualInputWeighted;
-    const output = this.totals.outputWeighted; // already × OUTPUT_TOKEN_RATE
+    const totals = this.enabledTotals();
+    const baseline = totals.baselineInputWeighted;
+    const actual = totals.actualInputWeighted;
+    const output = totals.outputWeighted; // already × OUTPUT_TOKEN_RATE
     const saved = baseline - actual;
     const pctInput = baseline > 0 ? (saved / baseline) * 100 : 0;
     const baselineTotal = baseline + output;
@@ -1141,9 +1210,9 @@ export class DashboardState {
     // and untransformed turns the gate said no to. Otherwise the headline
     // answers "did pxpipe help on the rows where it ran" instead of
     // "did pxpipe move my real bill". The first is a cherry-pick.
-    const allBaselineEquiv = this.totals.allBaselineEquivalentWeighted;
-    const allActual = this.totals.allActualInputWeighted;
-    const allOutput = this.totals.allOutputWeighted;
+    const allBaselineEquiv = totals.allBaselineEquivalentWeighted;
+    const allActual = totals.allActualInputWeighted;
+    const allOutput = totals.allOutputWeighted;
     // Denominator = counterfactual all-rows bill: what the user would have
     // paid with no pxpipe. Bounded ratio at 100%; a single cold-miss
     // compressed request on an otherwise empty session shows ~99% saved,
@@ -1160,22 +1229,22 @@ export class DashboardState {
     // gate is NOT cancelled — the operator interprets that via the
     // sample-count caveat below.
     const compressedTokenEquiv =
-      this.totals.compressedActualInputWeighted +
-      this.totals.compressedOutputWeighted;
+      totals.compressedActualInputWeighted +
+      totals.compressedOutputWeighted;
     const passthroughTokenEquiv =
-      this.totals.passthroughActualInputWeighted +
-      this.totals.passthroughOutputWeighted;
+      totals.passthroughActualInputWeighted +
+      totals.passthroughOutputWeighted;
     const compressedActualUsd =
       (compressedTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
     const passthroughActualUsd =
       (passthroughTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
     const compressedAvgUsd =
-      this.totals.compressedPaidRequests > 0
-        ? compressedActualUsd / this.totals.compressedPaidRequests
+      totals.compressedPaidRequests > 0
+        ? compressedActualUsd / totals.compressedPaidRequests
         : 0;
     const passthroughAvgUsd =
-      this.totals.passthroughPaidRequests > 0
-        ? passthroughActualUsd / this.totals.passthroughPaidRequests
+      totals.passthroughPaidRequests > 0
+        ? passthroughActualUsd / totals.passthroughPaidRequests
         : 0;
     // Sufficient-sample threshold is a soft heuristic. 20 paid requests per
     // bucket is enough to see a real effect on Opus 4.7 traffic (a single
@@ -1183,14 +1252,14 @@ export class DashboardState {
     // bucket numbers but hides the delta and surfaces "small sample".
     const SUFFICIENT = 20;
     const splitSufficient =
-      this.totals.compressedPaidRequests >= SUFFICIENT &&
-      this.totals.passthroughPaidRequests >= SUFFICIENT;
+      totals.compressedPaidRequests >= SUFFICIENT &&
+      totals.passthroughPaidRequests >= SUFFICIENT;
     const splitDeltaUsd = compressedAvgUsd - passthroughAvgUsd;
 
-    const uptimeSec = Date.now() / 1000 - this.totals.startedAt;
+    const uptimeSec = Date.now() / 1000 - totals.startedAt;
     const payload = {
-      requests: this.totals.requests,
-      compressed_requests: this.totals.compressedRequests,
+      requests: totals.requests,
+      compressed_requests: totals.compressedRequests,
       baseline_input_weighted: Math.round(baseline),
       actual_input_weighted: Math.round(actual),
       saved_input_tokens: Math.round(saved),
@@ -1208,13 +1277,13 @@ export class DashboardState {
       all_baseline_equivalent_weighted: Math.round(allBaselineEquiv),
       all_actual_input_weighted: Math.round(allActual),
       all_output_weighted: Math.round(allOutput),
-      all_usage_requests: this.totals.allUsageRequests,
+      all_usage_requests: totals.allUsageRequests,
       // Direct observed split — replaces "share of spend saved" as the
       // headline. Total actual $ and average $/req per path, plus a delta
       // gated on `split_sufficient_sample`. No counterfactual: each
       // bucket is what each path actually billed.
-      compressed_paid_requests: this.totals.compressedPaidRequests,
-      passthrough_paid_requests: this.totals.passthroughPaidRequests,
+      compressed_paid_requests: totals.compressedPaidRequests,
+      passthrough_paid_requests: totals.passthroughPaidRequests,
       compressed_actual_usd: round4(compressedActualUsd),
       passthrough_actual_usd: round4(passthroughActualUsd),
       compressed_avg_usd_per_request: round4(compressedAvgUsd),
@@ -1241,11 +1310,11 @@ export class DashboardState {
       // operator weigh how representative the numbers are; when it's near
       // `requests`, the gap is real. When it's 0, the scanner never landed
       // (5xx-heavy session, no /v1/messages traffic).
-      measured_text_chars: this.totals.textCharsMeasured,
-      measured_thinking_chars: this.totals.thinkingCharsMeasured,
-      measured_tool_use_chars: this.totals.toolUseCharsMeasured,
-      measured_redacted_block_count: this.totals.redactedBlockCountMeasured,
-      events_with_measurement: this.totals.eventsWithMeasurement,
+      measured_text_chars: totals.textCharsMeasured,
+      measured_thinking_chars: totals.thinkingCharsMeasured,
+      measured_tool_use_chars: totals.toolUseCharsMeasured,
+      measured_redacted_block_count: totals.redactedBlockCountMeasured,
+      events_with_measurement: totals.eventsWithMeasurement,
       uptime_sec: uptimeSec,
       compression_enabled: this.compressionEnabled,
     };
@@ -1446,6 +1515,18 @@ export class DashboardState {
     if (on) next.add(model);
     else next.delete(model);
     setAllowedModelBases([...next]);
+  }
+
+  /** POST /fragments/models with {list} — replace the WHOLE runtime compress
+   *  scope from the PXPIPE_MODELS textbox. Same CSV shape as the env var;
+   *  empty or off/false/0/no/none = compress nothing. In-memory only. */
+  handleModelsSet(csv: string): void {
+    const trimmed = csv.trim();
+    const bases =
+      !trimmed || /^(0|false|no|off|none)$/i.test(trimmed)
+        ? []
+        : trimmed.split(',').map((s) => s.trim()).filter(Boolean);
+    setAllowedModelBases(bases);
   }
 }
 

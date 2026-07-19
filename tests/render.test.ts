@@ -12,6 +12,8 @@ import {
   SLOT_MARK_USER,
   SLOT_MARK_ASSISTANT,
   ROLE_PALETTE,
+  renderCellHeight,
+  renderCellWidth,
   CELL_H,
   CELL_W,
 } from '../src/core/render.js';
@@ -41,6 +43,32 @@ import {
   BELOW_MIN_CHARS_BORDERLINE,
   synthesizeText,
 } from './fixtures/real-shapes.js';
+
+describe('model-selectable font atlases', () => {
+  it('uses the JetBrains Mono 10 cell geometry without changing the default atlas', async () => {
+    expect(renderCellWidth({ aa: true })).toBe(5);
+    expect(renderCellHeight({ aa: true })).toBe(8);
+    expect(renderCellWidth({ font: 'jetbrains-mono-10', aa: true })).toBe(6);
+    expect(renderCellHeight({ font: 'jetbrains-mono-10', aa: true })).toBe(11);
+
+    const text = 'tokenLedgerShard a3f9c1e0b7d2';
+    const defaultImg = await renderChunkToPng(text, 40, { aa: true });
+    const solImg = await renderChunkToPng(text, 40, { font: 'jetbrains-mono-10', aa: true });
+    expect(defaultImg.width).toBe(208);
+    expect(solImg.width).toBe(248);
+    expect(solImg.height).toBeGreaterThan(defaultImg.height);
+    expect(Buffer.from(solImg.png)).not.toEqual(Buffer.from(defaultImg.png));
+  });
+
+  it('falls back to the full Spleen/Unifont atlas for Unicode outside the compact Sol atlas', async () => {
+    const img = await renderChunkToPng('한글 test', 20, {
+      font: 'jetbrains-mono-10',
+      aa: true,
+    });
+    expect(img.droppedChars).toBe(0);
+  });
+
+});
 
 describe('compactSlabWhitespace', () => {
   it('returns empty string unchanged', () => {
@@ -336,15 +364,24 @@ describe('renderer', () => {
     expect(img.droppedChars).toBe(0);
   });
 
-  it('treats codepoints outside the atlas as dropped (e.g. emoji)', async () => {
+  it('escapes codepoints outside the atlas instead of dropping them (e.g. emoji)', async () => {
     // 😀 is U+1F600 — Supplementary Plane, not in BMP. Even `full-bmp` profile
-    // wouldn't cover it. Renderer must advance by 1 cell and bump the counter,
-    // not crash on the surrogate pair.
+    // wouldn't cover it. It renders as the lossless ASCII escape [U+1F600]
+    // (see escapeMissingGlyphs), not as a blank cell — and must not crash on
+    // the surrogate pair.
     const img = await renderChunkToPng('hi 😀 world');
-    expect(img.droppedChars).toBe(1);
-    // charsRendered counts codepoints, NOT UTF-16 units — the emoji is one
-    // codepoint even though it occupies two UTF-16 units.
+    expect(img.droppedChars).toBe(0);
+    // charsRendered counts SOURCE codepoints, NOT UTF-16 units — the emoji is
+    // one codepoint even though it occupies two UTF-16 units.
     expect(img.charsRendered).toBe(10); // 'hi ' (3) + 😀 (1) + ' world' (6) = 10
+  });
+
+  it('treats escape-exempt invisibles as dropped with 1-cell advance (e.g. VS16)', async () => {
+    // U+FE0F (variation selector-16) is deliberately NOT escaped — it's an
+    // emoji presentation modifier, noise if spelled out. Renderer must advance
+    // by 1 cell and bump the counter.
+    const img = await renderChunkToPng('hi ️ world');
+    expect(img.droppedChars).toBe(1);
   });
 
   it('CJK characters advance two cells; mixed lines wrap correctly', async () => {
@@ -469,21 +506,21 @@ describe('renderer', () => {
   });
 
   it('droppedCodepoints map is populated correctly when drops occur', async () => {
-    // 😀 is supplementary-plane (not in atlas regardless of profile). The
-    // codepoint should appear in the map with count 1; charsRendered counts
-    // it as a single codepoint.
-    const img = await renderChunkToPng('hi 😀 there');
+    // Emoji now escape to [U+HEX] instead of dropping, so the drop path is
+    // exercised via an escape-EXEMPT codepoint: U+FE0F (variation selector).
+    // The codepoint should appear in the map with count 1.
+    const img = await renderChunkToPng('hi ️ there');
     expect(img.droppedChars).toBe(1);
     expect(img.droppedCodepoints.size).toBe(1);
-    expect(img.droppedCodepoints.get(0x1f600)).toBe(1);
+    expect(img.droppedCodepoints.get(0xfe0f)).toBe(1);
   });
 
   it('droppedCodepoints tallies repeat drops correctly', async () => {
-    // Three occurrences of the same dropped codepoint → count 3.
-    const img = await renderChunkToPng('😀😀😀');
+    // Three occurrences of the same dropped (exempt) codepoint → count 3.
+    const img = await renderChunkToPng('a️b️c️');
     expect(img.droppedChars).toBe(3);
     expect(img.droppedCodepoints.size).toBe(1);
-    expect(img.droppedCodepoints.get(0x1f600)).toBe(3);
+    expect(img.droppedCodepoints.get(0xfe0f)).toBe(3);
   });
 
   // --- Whitespace minify (HANDOFF R1) ---------------------------------------
@@ -747,9 +784,9 @@ describe('transform', () => {
   it('ships annotation-stripped schemas in tools[], full schema in the imaged reference', async () => {
     // History: a bare `{type:'object'}` stub caused validator 400s; a text
     // reference paid the annotations at text rates. Current contract: tools[]
-    // keeps the structural contract (type/properties/required/enum) for the
-    // validator, annotations (description/default/$schema) move into the
-    // imaged reference where they cost image rates.
+    // keeps the structural contract (type/properties/required/enum) AND the
+    // `$schema` dialect declaration for the validator; annotations
+    // (description/default) move into the imaged reference at image rates.
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -821,9 +858,11 @@ describe('transform', () => {
     expect(Object.keys(s0.properties)).toEqual(['file_path', 'mode']);
     expect(s0.required).toEqual(['file_path']);
     expect(s0.properties.mode.enum).toEqual(['read', 'binary']);
-    // Annotations are stripped from tools[] everywhere in the tree.
+    // Annotations are stripped from tools[] everywhere in the tree — but the
+    // `$schema` dialect declaration survives (stripping it re-dialects a
+    // draft-07 schema to 2020-12 and the validator 400s legal draft-07 syntax).
     expect(JSON.stringify(s0)).not.toContain('description');
-    expect(s0.$schema).toBeUndefined();
+    expect(s0.$schema).toBe('http://json-schema.org/draft-07/schema#');
     expect(s0.properties.mode.default).toBeUndefined();
     const s1 = out.tools[1].input_schema;
     expect(s1.required).toEqual(['command']);
@@ -837,6 +876,67 @@ describe('transform', () => {
     // Stubs cite the reference heading.
     expect(out.tools[0].description).toContain('"## Tool: Read"');
     expect(out.tools[1].description).toContain('"## Tool: Bash"');
+  });
+
+  it('keeps $schema so draft-07 tuple items stay valid under the declared dialect', async () => {
+    // Regression (2026-07-05): Voiceflow MCP's voiceflow_transcript declares
+    // draft-07 and uses tuple-form `items: [...]`, which is illegal in the
+    // API's default dialect (2020-12, where tuples are `prefixItems`).
+    // Stripping `$schema` re-dialected the schema and every compressed request
+    // 400'd: "tools.N.custom.input_schema: JSON schema is invalid. It must
+    // match JSON Schema draft 2020-12". Passthrough of the same schema is
+    // accepted — so the transform must keep the declaration.
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        {
+          name: 'voiceflow_transcript',
+          description: 'Search transcripts',
+          input_schema: {
+            $schema: 'http://json-schema.org/draft-07/schema#',
+            type: 'object',
+            properties: {
+              filters: {
+                type: 'array',
+                items: {
+                  oneOf: [
+                    {
+                      type: 'object',
+                      properties: {
+                        op: { type: 'string', enum: ['between'], description: 'operator' },
+                        // draft-07 tuple validation — array-form `items`.
+                        value: {
+                          type: 'array',
+                          items: [
+                            { type: 'number', description: 'lower bound' },
+                            { type: 'number', description: 'upper bound' },
+                          ],
+                        },
+                      },
+                      required: ['op', 'value'],
+                    },
+                  ],
+                },
+              },
+            },
+            required: ['filters'],
+          },
+        },
+      ],
+    });
+    const { body, info } = await transformRequest(new TextEncoder().encode(req));
+    expect(info.compressed).toBe(true);
+    const out = JSON.parse(new TextDecoder().decode(body));
+    const s = out.tools[0].input_schema;
+    // Dialect declaration survives — the tuple `items` stays legal.
+    expect(s.$schema).toBe('http://json-schema.org/draft-07/schema#');
+    const between = s.properties.filters.items.oneOf[0];
+    expect(Array.isArray(between.properties.value.items)).toBe(true);
+    expect(between.properties.value.items).toEqual([{ type: 'number' }, { type: 'number' }]);
+    // Annotations still stripped.
+    expect(between.properties.op.description).toBeUndefined();
   });
 
   it('passes a bare {type:"object"} schema through with no advisory', async () => {
@@ -868,6 +968,73 @@ describe('transform', () => {
     const { body } = await transformRequest(new TextEncoder().encode(req));
     const out = JSON.parse(new TextDecoder().decode(body));
     expect('input_schema' in out.tools[0]).toBe(false);
+  });
+
+  // #43: Anthropic's native server-side tools (versioned `type`, e.g.
+  // advisor_20260301, web_search_20250305) have a fixed API schema that rejects
+  // a `description` field on the tool entry ("Extra inputs are not permitted"
+  // → 400). Only client-defined tools (no `type`, or explicit type:"custom")
+  // may be stubbed and imaged; everything else must pass through byte-identical.
+  it('passes native typed tools through untouched and keeps them out of the imaged reference (#43)', async () => {
+    const nativeAdvisor = { type: 'advisor_20260301', name: 'advisor' };
+    const nativeSearch = { type: 'web_search_20250305', name: 'web_search', max_uses: 3 };
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        {
+          name: 'BigTool',
+          description: 'A very long tool description. '.repeat(500),
+          input_schema: { type: 'object', properties: { x: { type: 'string' } } },
+        },
+        nativeAdvisor,
+        nativeSearch,
+      ],
+    });
+    const { body, info } = await transformRequest(new TextEncoder().encode(req));
+    expect(info.compressed).toBe(true);
+    const out = JSON.parse(new TextDecoder().decode(body));
+
+    // Client tool alongside is still compressed — the guard must not disable
+    // the rewrite for the rest of the array.
+    expect(out.tools[0].description).toContain('"## Tool: BigTool"');
+
+    // Native typed entries: byte-identical passthrough. Any injected key
+    // (description, input_schema, …) is a 400 upstream.
+    expect(out.tools[1]).toEqual(nativeAdvisor);
+    expect(out.tools[2]).toEqual(nativeSearch);
+
+    // And they contribute nothing to the imaged Tool Reference — their docs
+    // live server-side; an empty "## Tool: <name>" heading is pure noise.
+    const imgSrc = info.imageSourceText ?? '';
+    expect(imgSrc).toContain('## Tool: BigTool');
+    expect(imgSrc).not.toContain('## Tool: advisor');
+    expect(imgSrc).not.toContain('## Tool: web_search');
+  });
+
+  it('still rewrites explicit type:"custom" tools (#43 guard must not over-block)', async () => {
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+      system: 'x'.repeat(30000),
+      tools: [
+        {
+          type: 'custom',
+          name: 'CustomTool',
+          description: 'A very long tool description. '.repeat(500),
+          input_schema: { type: 'object', properties: { x: { type: 'string' } } },
+        },
+      ],
+    });
+    const { body, info } = await transformRequest(new TextEncoder().encode(req));
+    expect(info.compressed).toBe(true);
+    const out = JSON.parse(new TextDecoder().decode(body));
+    // type:"custom" is the client-defined shape — it accepts description, so it
+    // gets the same stub-and-image treatment as untyped entries.
+    expect(out.tools[0].type).toBe('custom');
+    expect(out.tools[0].description).toContain('"## Tool: CustomTool"');
+    expect(info.imageSourceText ?? '').toContain('## Tool: CustomTool');
   });
 
   // Snapshot-style tests against real-world Claude Code tool schemas.
@@ -1521,6 +1688,30 @@ describe('transform', () => {
     expect(info.unknownStaticTags).toBeUndefined();
   });
 
+  it('does not flag nested skill-catalogue tags (name/description/location/skill)', async () => {
+    // Nested under <available_skills>; static for a session, churn still observed.
+    const sys =
+      'claude.md\n'.repeat(400) +
+      '<available_skills>\n' +
+      '<skill>\n' +
+      '<name>demo-skill</name>\n' +
+      '<description>Do the demo thing</description>\n' +
+      '<location>~/.claude/skills/demo/SKILL.md</location>\n' +
+      '</skill>\n' +
+      '</available_skills>\n' +
+      '<available_references>\nref-a\n</available_references>\n' +
+      '<env>\nWorking directory: /tmp\n</env>';
+    const body = new TextEncoder().encode(
+      JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'hi' }],
+        system: sys,
+      }),
+    );
+    const { info } = await transformRequest(body);
+    expect(info.unknownStaticTags).toBeUndefined();
+  });
+
   it('omits unknownStaticTags when the static slab has no tag-shaped blocks', async () => {
     const sys = 'claude.md\n'.repeat(400) + '<env>\nWorking directory: /tmp\n</env>';
     const body = new TextEncoder().encode(
@@ -1713,17 +1904,19 @@ describe('transform', () => {
   // capture & inspect the request body.
 
   it('populates droppedCodepointsTop when drops occur, sorted by count', async () => {
-    // System slab forces compression. The slab contains drops for two distinct
-    // supplementary-plane codepoints at different rates so we can verify the
-    // sort order.
-    const cpA = String.fromCodePoint(0x1f600); // 😀
-    const cpB = String.fromCodePoint(0x1f604); // 😄
-    const cpC = String.fromCodePoint(0x1f60a); // 😊
+    // System slab forces compression. Emoji now escape to [U+HEX] instead of
+    // dropping, so the drop path is exercised via escape-EXEMPT codepoints:
+    // plane-14 variation selectors (U+E01xx — astral, guaranteed absent from
+    // the BMP atlas, and deliberately never escaped). Three distinct
+    // codepoints at different rates so we can verify the sort order.
+    const cpA = String.fromCodePoint(0xe0100);
+    const cpB = String.fromCodePoint(0xe0104);
+    const cpC = String.fromCodePoint(0xe010a);
     const sys =
       'x'.repeat(150000) + // bulk to force compression
-      '\n' + cpA.repeat(10) +  // 10 drops of U+1F600
-      '\n' + cpB.repeat(3) +   // 3  drops of U+1F604
-      '\n' + cpC.repeat(1);    // 1  drop  of U+1F60A
+      '\n' + cpA.repeat(10) +  // 10 drops of U+E0100
+      '\n' + cpB.repeat(3) +   // 3  drops of U+E0104
+      '\n' + cpC.repeat(1);    // 1  drop  of U+E010A
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
       messages: [{ role: 'user', content: 'hi' }],
@@ -1734,9 +1927,9 @@ describe('transform', () => {
     expect(info.droppedChars).toBeGreaterThanOrEqual(14);
     expect(info.droppedCodepointsTop).toBeDefined();
     const top = info.droppedCodepointsTop!;
-    expect(top['U+1F600']).toBe(10);
-    expect(top['U+1F604']).toBe(3);
-    expect(top['U+1F60A']).toBe(1);
+    expect(top['U+E0100']).toBe(10);
+    expect(top['U+E0104']).toBe(3);
+    expect(top['U+E010A']).toBe(1);
     // Ensure key format is the expected U+HHHH uppercase with no surprises.
     for (const k of Object.keys(top)) {
       expect(k).toMatch(/^U\+[0-9A-F]{4,}$/);
@@ -1744,7 +1937,7 @@ describe('transform', () => {
     // Sorted by count desc: iteration of object keys preserves insertion order
     // in V8/JSC, so the first key is the highest-count drop.
     const keys = Object.keys(top);
-    expect(keys[0]).toBe('U+1F600');
+    expect(keys[0]).toBe('U+E0100');
   });
 
   it('omits droppedCodepointsTop entirely when no drops occur', async () => {
@@ -1761,13 +1954,15 @@ describe('transform', () => {
   });
 
   it('caps droppedCodepointsTop at 20 entries', async () => {
-    // 25 distinct supplementary-plane codepoints, each appearing N times so
-    // we can verify the cap drops the smallest counts.
+    // 25 distinct escape-exempt codepoints (plane-14 variation selectors —
+    // astral, so guaranteed atlas misses; exempt, so guaranteed drops rather
+    // than [U+HEX] escapes), each appearing N times so we can verify the cap
+    // drops the smallest counts.
     let payload = 'x'.repeat(150000) + '\n';
     for (let i = 0; i < 25; i++) {
-      // U+1F300..U+1F318 — 25 distinct codepoints, each occurring (25 - i) times
-      // so U+1F300 occurs 25 times, U+1F318 occurs 1 time.
-      payload += String.fromCodePoint(0x1f300 + i).repeat(25 - i);
+      // U+E0100..U+E0118 — 25 distinct codepoints, each occurring (25 - i) times
+      // so U+E0100 occurs 25 times, U+E0118 occurs 1 time.
+      payload += String.fromCodePoint(0xe0100 + i).repeat(25 - i);
     }
     const req = JSON.stringify({
       model: 'claude-3-5-sonnet',
@@ -1781,11 +1976,11 @@ describe('transform', () => {
     // The 5 smallest-count codepoints (last in the input) must be dropped
     // from the top-20.
     for (let i = 20; i < 25; i++) {
-      const hex = (0x1f300 + i).toString(16).toUpperCase().padStart(4, '0');
+      const hex = (0xe0100 + i).toString(16).toUpperCase().padStart(4, '0');
       expect(top[`U+${hex}`]).toBeUndefined();
     }
     // The top entry is the most-frequent.
-    expect(top['U+1F300']).toBe(25);
+    expect(top['U+E0100']).toBe(25);
   });
 
   // --- Per-block break-even gate (URGENT slice, supersedes prior threshold tests) ---

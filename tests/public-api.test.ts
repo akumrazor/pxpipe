@@ -83,27 +83,54 @@ describe('public library API', () => {
       // null clears the override → back to the Fable-only default
       setAllowedModelBases(null);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
+      expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(false);
       expect(isPxpipeSupportedModel('claude-opus-4-8')).toBe(false);
     } finally {
       setAllowedModelBases(null); // never leak the override into other tests
     }
   });
 
-  it('recognizes GPT 5.6 as the default OpenAI imaging scope (5.5 opt-in)', () => {
+  it('keeps GPT 5.6 Sol aliases opt-in by default', () => {
     expect(isPxpipeSupportedGptModel('gpt-5')).toBe(false);
-    // gpt-5.5 degrades on imaged context, so it is off by default now.
     expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5.5-codex')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.5-2026-06-01')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(false);
     expect(isPxpipeSupportedGptModel('gpt-5-mini')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-nano')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.6[1m]')).toBe(true);
     expect(isPxpipeSupportedGptModel('gpt-4o')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-50')).toBe(false);
-    expect(isPxpipeSupportedGptModel('')).toBe(false);
-    expect(isPxpipeSupportedGptModel('claude-opus-4-8')).toBe(false);
-    expect(isPxpipeSupportedGptModel(null)).toBe(false);
+
+    process.env.PXPIPE_MODELS = 'gpt-5.6-sol';
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol[1m]')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex[1m]')).toBe(true);
+    expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
+    expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(false);
+  });
+
+  it('keeps Grok and Sol opt-in by default', () => {
+    // Grok remains opt-in because its arithmetic, gist, and state results are
+    // below the Fable bar.
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      delete process.env.PXPIPE_MODELS;
+      expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(false);
+      expect(isPxpipeSupportedGptModel('grok-4')).toBe(false);
+      expect(isPxpipeSupportedGptModel('grok-4.20')).toBe(false);
+      expect(getAllowedModelBases()).not.toContain('grok-4.5');
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5']);
+
+      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol,grok-4.5';
+      expect(isPxpipeSupportedGptModel('grok-4.5')).toBe(true);
+      expect(isPxpipeSupportedGptModel('grok-4.5-fast')).toBe(true); // -suffix alias
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
   });
 
   it('honors the single PXPIPE_MODELS scope for GPT families', () => {
@@ -112,17 +139,17 @@ describe('public library API', () => {
       // Explicit Claude-only scope disables GPT imaging.
       process.env.PXPIPE_MODELS = 'claude-fable-5';
       expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(false);
-      expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
 
       // Mixed CSV selects exactly those bases across families.
-      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6';
+      process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol';
       expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(false);
-      expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(true);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(true);
 
       // `off` disables everything.
       process.env.PXPIPE_MODELS = 'off';
-      expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
+      expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
       expect(isPxpipeSupportedModel('claude-fable-5')).toBe(false);
     } finally {
       if (prev === undefined) delete process.env.PXPIPE_MODELS;
@@ -279,6 +306,38 @@ describe('public library API', () => {
     // The caller sent zero markers, so the rewritten body also has zero.
     expect(transformed.cache.ownsCacheControl).toBe(false);
     expect(transformed.cache.markerCount).toBe(0);
+  });
+
+  it('preserves the exact Claude Code OAuth identity as the first system block', async () => {
+    const identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+    const body = enc.encode(JSON.stringify({
+      model: 'claude-fable-5',
+      system: [
+        { type: 'text', text: identity },
+        {
+          type: 'text',
+          text: 'Detailed Claude Code operating instructions. '.repeat(1200),
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      tools: [{
+        name: 'read_file',
+        description: 'Read a file from disk. '.repeat(200),
+        input_schema: { type: 'object', properties: { path: { type: 'string' } } },
+      }],
+      messages: [{ role: 'user', content: 'hello' }],
+    }));
+
+    const transformed = await transformAnthropicMessages({ body, model: 'claude-fable-5' });
+    expect(transformed.applied).toBe(true);
+    expect(transformed.info.imageCount).toBeGreaterThan(0);
+
+    const out = JSON.parse(dec.decode(transformed.body)) as {
+      system?: Array<{ type: string; text?: string; cache_control?: unknown }>;
+    };
+    expect(out.system?.[0]).toEqual({ type: 'text', text: identity });
+    expect(out.system?.[0]?.cache_control).toBeUndefined();
+    expect(transformed.info.imageSourceText).not.toContain(identity);
   });
 
   it('transforms GPT 5.5 chat completions using OpenAI image_url blocks', async () => {

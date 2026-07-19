@@ -24,7 +24,7 @@ Pricing relative to base input rate:
 | bucket | meaning | rate |
 |---|---|---:|
 | `input_tokens` | uncached input | `1.0x` |
-| `cache_creation_input_tokens` (`cc`) | cache write | `1.25x` |
+| `cache_creation_input_tokens` (`cc`) | cache write | `1.25x` (5m) / `2x` (1h) |
 | `cache_read_input_tokens` (`cr`) | cache read | `0.1x` |
 | output | model reply | `5x` input on Fable 5 |
 
@@ -97,7 +97,7 @@ For each `/v1/messages` request, pxpipe records three measurements:
 The actual input cost is:
 
 ```text
-actual_eff = input_tokens + cc * 1.25 + cr * 0.10
+actual_eff = input_tokens + cc_5m * 1.25 + cc_1h * 2.0 + cr * 0.10
 ```
 
 The text baseline first splits the measured text tokens:
@@ -110,7 +110,7 @@ coldTail  = baseline_tokens - cacheable
 If the actual request is cold (`cr === 0`):
 
 ```text
-baseline_eff = cacheable * 1.25 + coldTail
+baseline_eff = cacheable * observed_write_rate + coldTail
 ```
 
 If the actual request is warm (`cr > 0`):
@@ -119,10 +119,10 @@ If the actual request is warm (`cr > 0`):
 reused = min(prevCacheable, cacheable)
 grown  = cacheable - reused
 
-baseline_eff = reused * 0.10 + grown * 1.25 + coldTail
+baseline_eff = reused * 0.10 + grown * observed_write_rate + coldTail
 ```
 
-`prevCacheable` is used only after `cr > 0` proves a warm read. It refines how much of the text baseline was reused vs newly grown. If there is no completed same-session prior with the same static-prefix hash, pxpipe assumes full reuse for the text baseline: `prevCacheable = cacheable`. That is conservative for savings because it makes the text baseline cheaper.
+`observed_write_rate` is the request's server-reported mix of 5-minute writes at `1.25x` and 1-hour writes at `2x`. If the API omits the tier split, pxpipe falls back to `1.25x` for backward compatibility. `prevCacheable` is used only after `cr > 0` proves a warm read. It refines how much of the text baseline was reused vs newly grown. If there is no completed same-session prior with the same static-prefix hash, pxpipe assumes full reuse for the text baseline: `prevCacheable = cacheable`. That is conservative for savings because it makes the text baseline cheaper.
 
 Replay uses request start time (`ts - duration_ms`) to avoid overlapping requests refining each other's `prevCacheable` split before the earlier request had completed.
 
@@ -190,6 +190,8 @@ Every row in `~/.pxpipe/events.jsonl` carries the fields needed to reproduce the
 - `baseline_cacheable_tokens`
 - `input_tokens`
 - `cache_create_tokens`
+- `cache_create_5m_tokens`
+- `cache_create_1h_tokens`
 - `cache_read_tokens`
 - `first_user_sha8`
 - `system_sha8`
@@ -211,3 +213,89 @@ The live dashboard and replay path both use `deriveBaselineWarmth`, `computeBase
 ## Summary
 
 pxpipe stays cache-aligned by replacing stable text context with stable image context and relocating the caller's existing cache marker to the end of the rewritten content. Savings are measured by comparing the real transformed request with a `/count_tokens` text counterfactual under the same observed cache state. If the actual request read cache, both sides are warm. If it did not, both sides are cold. Therefore the provider cache discount is not counted as pxpipe savings; the reported savings are only the token reduction from text to images.
+
+---
+
+## OpenAI / Responses Path (Codex And Friends)
+
+Codex is supported. The wire protocol is `/v1/responses` (and, when present,
+chat-completions-shaped OpenAI paths). pxpipe images the same two buckets as
+on Anthropic: the static slab (system + tool docs + large stable context) and,
+when the closed history prefix clears a token floor and the profitability gate,
+older history.
+
+The savings number is still "text counterfactual under the same observed cache
+state minus the imaged request." OpenAI usage reports `cached_tokens` as a
+subset of `input_tokens` (not a separate cache-create / cache-read pair). The
+math lives in `src/core/openai-savings.ts`:
+
+```text
+actual_eff   = uncached + cached * cache_read_rate(model)
+baseline_eff = actual_eff + (baseline_imaged_tokens - image_tokens)
+               * (cache_read_rate(model) if cached > 0 else 1.0)
+```
+
+`cache_read_rate` is model-based on the shared Responses path (Claude 0.1,
+gpt-5 0.1, Grok 0.25). The provider cache discount is applied to both sides, so
+it is never counted as a pxpipe win.
+
+### What actually drives savings
+
+Savings track **how much uncached bulk the client still re-sends as text**, not
+the product name and not the path alone.
+
+| Client shape | What the proxy sees each turn | Typical result |
+|---|---|---|
+| Claude Code on `/anthropic/messages` | Large system + tools + history re-sent as text; Anthropic cache markers on a stable prefix | High savings once imaged (~60–70% on dense traffic) |
+| Codex / OpenAI Responses with a warm prompt cache | Most of the prompt already `cached_tokens`; only the static slab and rare history collapses are imageable | Low % when history does not collapse; the % is honest |
+| Same Responses path, history collapse fires | Closed prefix large enough and profitable → many history images | Meaningful savings (measured gpt-5 collapsed warm rows ~40%) |
+| OpenAI client that re-sends the full transcript as plain text every turn (classic chat-completions style, cold or no useful cache) | Large uncached bulk every request | Same class of win as Claude Code: the gate has real text to beat |
+
+Measured on local `/v1/responses` rows (same endpoint, different models):
+
+| Family | Cached share of input | History collapse | Computed saved |
+|---|---:|---|---:|
+| claude (Codex → Opus) | ~98% | was blocked by a row-count gate bug; should collapse after the ↵ fix | was ~1% slab-only; re-measure on live Codex |
+| grok | high on warm multi-turn | **collapsed** after ↵ gate fix | ~**35%** on collapsed Responses rows (n=35 post-fix); fixture image+factsheet ~70% |
+| gpt-5 | ~73% | often | ~34% overall; ~42% on collapsed warm rows |
+
+Render profiles are selected by exact model id, not by the shared Responses
+path. Opt-in `gpt-5.6-sol` uses 152 columns with a 5×8 Spleen atlas;
+Claude uses 312 columns with the 5×8 Spleen atlas. Grok remains **opt-in** and
+uses **5×8** / 152 columns at maxHeight 512 with white AA (**no grid**) plus an
+in-image IDS block and the text factsheet. Its measured arithmetic, gist, and
+state results remain below Fable. See
+[eval/grok-density/QUALITY_RESULTS.md](../eval/grok-density/QUALITY_RESULTS.md).
+
+The early n=1 raw-image pilot failed both 6×11 and the old shared 5×8
+call. The larger production-profile follow-up scored 96/100 pure and
+98/100 production arithmetic, but broader gist and dense exact recall remained
+below Fable. Sol is kept opt-in; sibling GPT-5.6 variants remain off.
+Production still sends the identifier factsheet because image text is not byte-safe. See
+[`eval/sol-profile/QUALITY_RESULTS.md`](../eval/sol-profile/QUALITY_RESULTS.md).
+
+
+So "Codex shows 1% on Opus" is not "Codex unsupported." It is "this session's
+prompt was already ~98% cached text, history collapse did not fire, and only
+the static slab was imaged." The same Codex path saves tens of percent when
+history collapse fires (gpt-5 above) or when the client re-sends uncached bulk.
+
+### Dashboard columns
+
+On OpenAI-shaped rows the dashboard fills **As text / Sent / Saved** only when
+the request was compressed and both `image_tokens` and `baseline_imaged_tokens`
+were recorded. Uncompressed rows (gate said `not_profitable`, model not
+allowlisted, etc.) correctly show `—`. Path selects the accounting shape
+(OpenAI vs Anthropic usage fields); model id selects rates and render profile.
+
+### Practical reading of a low Saved %
+
+1. Check `path`. `/anthropic/messages` and `/v1/responses` are different
+   clients even when the model id is `claude-opus-4-8`.
+2. Check `cached_tokens / input_tokens`. Near 100% means there is little left
+   for imaging to beat under honest same-cache accounting.
+3. Check `history_reason`. `collapsed` is where large Codex/OpenAI savings
+   come from; `not_profitable` / `below_min_tokens` / `prefix_too_short` mean
+   only the slab (or nothing) was imaged.
+4. Do not compare a Claude Code session's 70% to a warm Codex session's 1%
+   as a regression. Different wire, different uncached bulk.

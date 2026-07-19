@@ -19,9 +19,23 @@
  *
  * Run just this file:  pnpm vitest run tests/savings-math-e2e.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createProxy, type ProxyEvent } from '../src/core/proxy.js';
 import { countTokens as o200k } from 'gpt-tokenizer/encoding/o200k_base';
+
+// The GPT tests below drive exact Sol. Pin PXPIPE_MODELS so the suite is
+// deterministic regardless of the developer's shell (same convention as
+// proxy-usage.test.ts) — without this, the file passes or fails depending on
+// ambient env, which is exactly what broke CI.
+let ambientPxpipeModels: string | undefined;
+beforeAll(() => {
+  ambientPxpipeModels = process.env.PXPIPE_MODELS;
+  process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol';
+});
+afterAll(() => {
+  if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
+  else process.env.PXPIPE_MODELS = ambientPxpipeModels;
+});
 
 const PROBE_TOKENS = 9999; // canned count_tokens result from the fake upstream
 
@@ -96,7 +110,7 @@ const slab = (n: number) =>
 
 const gptBody = (sysChars: number) =>
   JSON.stringify({
-    model: 'gpt-5.6',
+    model: 'gpt-5.6-sol',
     messages: [
       { role: 'system', content: slab(sysChars) },
       { role: 'user', content: 'hello' },
@@ -146,10 +160,18 @@ describe('savings math — GPT, cross-checked against the real o200k tokenizer',
   });
 
   it('DECLINES A LOSER: refuses to image content where imaging would cost more than the real text', async () => {
-    // 2000-char slab: ~374 real tokens, but it would render to a ~1400-token image.
-    const sys = slab(2_000);
+    // Long interior whitespace survives render minification and consumes cells,
+    // but o200k represents each run with very few tokens.
+    const sys = Array.from({ length: 1_000 }, () => `a${' '.repeat(100)}b`).join('');
     const realTok = o200k(sys);
-    const { event, out } = await driveAndCapture('/v1/chat/completions', gptBody(2_000));
+    const body = JSON.stringify({
+      model: 'gpt-5.6-sol',
+      messages: [
+        { role: 'system', content: sys },
+        { role: 'user', content: 'hello' },
+      ],
+    });
+    const { event, out } = await driveAndCapture('/v1/chat/completions', body);
     expect(event.info?.compressed).toBe(false);
     expect(event.info?.gateEval?.profitable).toBe(false);
     // The would-be image cost genuinely exceeds the real text cost → declining is correct.

@@ -17,8 +17,12 @@
 /** ReDoS-safe extraction patterns (each global). Ordered most- to least-specific so the
  *  longest, most-identifying tokens are kept first when the substring filter runs. */
 const PATTERNS: readonly RegExp[] = [
+  /\b[A-Z][A-Z0-9_]{2,}=[^\s)"'<>]+/g, // semantic LABEL=value pair (preserve association)
   /\bhttps?:\/\/[^\s)"'<>]+/g, // URLs
+  /\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\b/g, // email address
   /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g, // UUID
+  /\b[A-Z]{2}\d{2}[A-Z0-9]{8,30}\b/g, // IBAN-like account string
+  /(?:[$€£¥]|(?:USD|EUR|GBP|CAD|AUD|CHF|JPY))\d(?:[\d,_]*\d)?(?:\.\d{2})?\b/g, // currency amount
   /(?:[\w@~+-]+)?(?:\/[\w.@+-]+)+\.[A-Za-z]\w{0,8}\b/g, // path with a file extension (multi-dot ok: .test.ts)
   /\/[\w.@+-]+(?:\/[\w.@+-]+)+\/?/g, // dir path (>=2 segments)
   /\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/g, // git sha / long hex (must contain a digit)
@@ -27,6 +31,10 @@ const PATTERNS: readonly RegExp[] = [
   /\b\d[\d,_]{3,}\b/g, // large / separated number
   /\b\d+\.\d+\b/g, // decimal
   /\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b/g, // CONST_IDS / env var names
+  // camelCase / PascalCase with ≥1 lowercase run and ≥1 internal capital
+  // (tokenLedgerShard, getUserById). Rejects ALL-CAPS words so history markers
+  // like CURRENT/FRONTIER do not flood the sheet.
+  /\b(?:[a-z]+|[A-Z][a-z0-9]+)(?:[A-Z][a-z0-9]*)+\b/g,
   // Ticket/advisory-style codes: uppercase hyphenated with ≥1 digit (PROJ-1482,
   // CVE-2024-30078, AUDIT-ZX9). Digit lookahead is bounded → no backtracking blowup.
   /\b(?=[A-Z0-9-]{0,119}\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b/g,
@@ -35,12 +43,14 @@ const PATTERNS: readonly RegExp[] = [
 const MIN_LEN = 3;
 const MAX_LEN = 120;
 /** Budget cap: highest-priority tokens kept first. Exported so consumers can report drops. */
-export const MAX_TOKENS = 64;
+export const MAX_TOKENS = 96;
 // At most this many URL exemplars: URLs are long, structured, low OCR-risk, and usually
 // reconstructable, so they must never crowd out short zero-redundancy tokens.
 const MAX_URLS = 8;
 const MAX_SEEN = 2048; // defensive bound on distinct tokens entering substring-collapse
 const MAX_SCAN = 262_144; // defensive input bound; tool_results are already paged
+// Match render DENSE_CONTENT_CHARS_PER_IMAGE without importing render (cycle-free).
+const FACTSHEET_PAGE_CHARS = 28_080;
 const MAX_CHUNK = 512; // whitespace-free chunks longer than this are blobs (base64, minified) — skip
 
 /** Budget priority by token SHAPE, not length — length is anti-correlated with
@@ -49,22 +59,32 @@ const MAX_CHUNK = 512; // whitespace-free chunks longer than this are blobs (bas
  *  identifiers outrank long URLs when the budget is tight. Pure + total → deterministic →
  *  cache-stable. Tiers: 0 = protect always, 1 = paths/versions/misc, 2 = URLs (cap + last). */
 const SHAPE_UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const SHAPE_EMAIL = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/;
+const SHAPE_IBAN = /^[A-Z]{2}\d{2}[A-Z0-9]{8,30}$/;
+const SHAPE_CURRENCY = /^(?:[$€£¥]|(?:USD|EUR|GBP|CAD|AUD|CHF|JPY))\d(?:[\d,_]*\d)?(?:\.\d{2})?$/;
 const SHAPE_HEX = /^(?=[0-9a-f]*\d)[0-9a-f]{7,40}$/; // git sha / opaque hex
 const SHAPE_CONST = /^[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+$/; // CONST_IDS / env vars
 const SHAPE_TICKET = /^(?=[A-Z0-9-]*\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+$/; // PROJ-1482 / CVE-2024-30078
 const SHAPE_FLAG = /^--?[A-Za-z][\w-]+$/; // CLI flag
 const SHAPE_NUM = /^\d[\d,_]*$|^\d+\.\d+$/; // port / large or separated number / decimal
 const SHAPE_URL = /^https?:\/\//;
+const SHAPE_CAMEL = /^(?:[a-z]+|[A-Z][a-z0-9]+)(?:[A-Z][a-z0-9]*)+$/; // tokenLedgerShard / getUserById
+const SHAPE_ASSIGNMENT = /^[A-Z][A-Z0-9_]{2,}=\S+$/; // ACTIVE_MANIFEST=/path
 
 /** Lower tier = higher keep-priority. Pure function of the token → deterministic. */
 function priorityTier(tok: string): 0 | 1 | 2 {
   if (
+    SHAPE_ASSIGNMENT.test(tok) ||
     SHAPE_HEX.test(tok) ||
     SHAPE_UUID.test(tok) ||
+    SHAPE_EMAIL.test(tok) ||
+    SHAPE_IBAN.test(tok) ||
+    SHAPE_CURRENCY.test(tok) ||
     SHAPE_CONST.test(tok) ||
     SHAPE_TICKET.test(tok) ||
     SHAPE_FLAG.test(tok) ||
-    SHAPE_NUM.test(tok)
+    SHAPE_NUM.test(tok) ||
+    (SHAPE_CAMEL.test(tok) && tok.length >= 8)
   ) {
     return 0;
   }
@@ -75,7 +95,7 @@ function priorityTier(tok: string): 0 | 1 | 2 {
 /**
  * Extract deduped, precision-critical tokens from `text`. Substrings of a longer kept
  * token are dropped (so `/github.com` inside the full URL, `lib/x.ts` inside
- * `src/lib/x.ts`, etc. collapse to the most specific form); the 64-token budget is then
+ * `src/lib/x.ts`, etc. collapse to the most specific form); the token budget is then
  * filled by priority tier (see `priorityTier`) so short, high-consequence tokens are never
  * evicted by long low-risk URLs.
  *
@@ -214,6 +234,10 @@ const OPEN =
  *  model can answer tally questions from the sheet instead of counting glyph rows. */
 const OPEN_COUNTS =
   '[Exact identifiers from the rendered context above (paths, ids, versions, numbers) — quote these verbatim instead of transcribing them from the image; ×N marks a token that occurs N times within the imaged content: ';
+const OPEN_COMPACT = '[Exact rendered identifiers—quote verbatim: ';
+const OPEN_COMPACT_COUNTS = '[Exact rendered identifiers—quote verbatim; ×N=count: ';
+
+export type FactSheetFormat = 'full' | 'compact';
 
 /** Build the one-line fact-sheet string from a pre-extracted token list. */
 export function factSheetTextFromTokens(tokens: string[]): string {
@@ -222,14 +246,27 @@ export function factSheetTextFromTokens(tokens: string[]): string {
 
 /** Build the one-line fact-sheet string from token+count entries. Byte-identical to
  *  `factSheetTextFromTokens` when no token repeats, so existing sheets stay cache-stable. */
-export function factSheetTextFromEntries(entries: readonly FactSheetEntry[]): string {
+export function factSheetTextFromEntries(
+  entries: readonly FactSheetEntry[],
+  format: FactSheetFormat = 'full',
+): string {
   if (entries.length === 0) return '';
   const anyRepeat = entries.some((e) => e.count >= 2);
   const body = entries.map((e) => (e.count >= 2 ? `${e.token} ×${e.count}` : e.token)).join(' · ');
-  return (anyRepeat ? OPEN_COUNTS : OPEN) + body + ']';
+  const opener = format === 'compact'
+    ? (anyRepeat ? OPEN_COMPACT_COUNTS : OPEN_COMPACT)
+    : (anyRepeat ? OPEN_COUNTS : OPEN);
+  return opener + body + ']';
 }
 
-/** One-line fact-sheet string for `text`, or `''` when nothing notable was found. */
-export function factSheetText(text: string): string {
-  return factSheetTextFromEntries(extractFactSheetEntries(text));
+/** One-line fact-sheet string for `text`, or `''` when nothing notable was found.
+ *  Single path for slab, history, and tool results: page long text so early-turn
+ *  ids are not dropped by MAX_SCAN. Short text is one page (same as before). */
+export function factSheetText(text: string, format: FactSheetFormat = 'full'): string {
+  if (!text) return '';
+  if (text.length <= MAX_SCAN) {
+    return factSheetTextFromEntries(extractFactSheetEntries(text), format);
+  }
+  const { kept } = extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS);
+  return factSheetTextFromEntries(kept, format);
 }

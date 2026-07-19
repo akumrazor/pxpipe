@@ -4,13 +4,22 @@
  */
 
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
-import { transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
+import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
 } from './measurement.js';
 import type { Usage } from './types.js';
+import {
+  anthropicMessagesToOpenAIResponses,
+  openAIResponsesToAnthropicResponse,
+} from './messages-responses-bridge.js';
+import {
+  anthropicMessagesToOpenAIChat,
+  chatCompletionsUrl,
+  openAIChatToAnthropicResponse,
+} from './messages-chat-bridge.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -28,11 +37,23 @@ export interface ProxyConfig {
   openAIUpstream?: string;
   /** Override or supply an OpenAI API key. If unset, we forward Authorization. */
   openAIApiKey?: string;
+  /** Cloudflare's OpenAI-compatible Chat Completions endpoint and bearer key. */
+  cloudflareUpstream?: string;
+  cloudflareApiKey?: string;
+  /** Exact model ids routed to each non-default provider. Unlisted Claude
+   * models retain normal Anthropic routing. */
+  openAIModels?: string[];
+  cloudflareModels?: string[];
   /** Pass a function to inject dynamic values per-request (e.g. live charsPerToken);
    *  static object for Workers/tests. */
   transform?: TransformOptions | (() => TransformOptions);
   /** Called after every request — useful for logging / metrics in the host. */
   onRequest?: (event: ProxyEvent) => void | Promise<void>;
+  /** Persist the gzipped request body on 4xx (→ reqBodyGz, sidecar/inline).
+   *  Off by default: request bodies hold full prompts and any secrets in
+   *  context, so raw-body capture is opt-in debugging only. The upstream
+   *  error body (errorBody) is unaffected — it carries no user content. */
+  captureErrorReqBody?: boolean;
 }
 
 export interface ProxyEvent {
@@ -40,6 +61,9 @@ export interface ProxyEvent {
   path: string;
   /** Top-level request model when present. Used for telemetry/dashboard labels only. */
   model?: string;
+  /** Provider cost/usage semantics after any internal wire bridge. Unlike
+   * `path`, this describes the upstream that actually billed the request. */
+  accountingProvider?: 'anthropic' | 'openai';
   status: number;
   /** Wall-clock ms from request start to event fire (≈ end of upstream body). */
   durationMs: number;
@@ -71,16 +95,36 @@ export interface ProxyEvent {
 /** Max chars of 4xx error body captured on ProxyEvent — enough for Anthropic's full error JSON. */
 const ERROR_BODY_MAX = 2048;
 
-/** Read the top-level `model` field from a /v1/messages body without parsing the full JSON.
- *  Returns null when not found — callers treat null as outside supported scope (fail-closed). */
+/** Read the actual top-level `model` field. The body is already buffered for
+ * transformation, so parsing it is both safer and simpler than a prefix regex
+ * (which could mistake `metadata.model` for the routing model). */
 function readModelField(body: Uint8Array): string | null {
   try {
-    const head = new TextDecoder().decode(body.subarray(0, 8192));
-    const m = /"model"\s*:\s*"([^"]{1,80})"/.exec(head);
-    return m ? m[1]! : null;
+    const value = JSON.parse(new TextDecoder().decode(body)) as { model?: unknown };
+    return typeof value.model === 'string' && value.model.length <= 200 ? value.model : null;
   } catch {
     return null;
   }
+}
+
+// Claude Code only admits gateway-discovered ids beginning with "claude" or
+// "anthropic". Prefix provider ids for discovery, then remove that compatibility
+// prefix before PXPIPE_MODELS matching and upstream routing.
+const CLAUDE_GATEWAY_MODEL_PREFIX = 'claude-';
+
+function claudeGatewayModelId(model: string): string {
+  if (model.startsWith('claude-') || model.startsWith('anthropic')) return model;
+  return CLAUDE_GATEWAY_MODEL_PREFIX + model;
+}
+
+function resolveClaudeGatewayModelId(model: string | null): string | undefined {
+  if (!model?.startsWith(CLAUDE_GATEWAY_MODEL_PREFIX)) return undefined;
+  const providerModel = model.slice(CLAUDE_GATEWAY_MODEL_PREFIX.length);
+  return providerModel.includes('/') ? providerModel : undefined;
+}
+
+function cloudflareModelDisplayName(model: string): string {
+  return /kimi-k3/i.test(model) ? 'Kimi K3 (Cloudflare)' : model;
 }
 
 /** Gzip via CompressionStream — available in Node 18+ and Cloudflare Workers. */
@@ -520,7 +564,14 @@ function isOpenAIResponsesPath(pathname: string): boolean {
 
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
   const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
-  const looksOpenAIAuth = hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key'));
+  // `/v1/models` exists on BOTH APIs, so it is routed by auth style — but an
+  // `sk-ant-…` bearer is Anthropic by construction (Claude Code subscription
+  // auth sends `authorization: Bearer sk-ant-oat01-…` with no x-api-key).
+  // Without this check that OAuth token would be forwarded to the OpenAI
+  // upstream: a credential leak, and a guaranteed 401.
+  const bearerIsAnthropic = /^Bearer\s+sk-ant-/i.test(headers.get('authorization') ?? '');
+  const looksOpenAIAuth =
+    hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key') && !bearerIsAnthropic);
   return pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
@@ -595,6 +646,19 @@ export function parseGatewayHeaders(spec: string | undefined): Record<string, st
 
 /** Build the proxy fetch handler. */
 export function createProxy(config: ProxyConfig = {}) {
+  const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
+  // Explicit precedence: Cloudflare > OpenAI > normal family routing.
+  for (const model of config.openAIModels ?? []) {
+    const id = model.trim();
+    if (id) modelRoutes.set(id, 'openai');
+  }
+  for (const model of config.cloudflareModels ?? []) {
+    const id = model.trim();
+    if (id) modelRoutes.set(id, 'cloudflare');
+  }
+  if ((config.cloudflareModels?.length ?? 0) > 0 && config.cloudflareUpstream === undefined) {
+    throw new Error('cloudflareModels requires a Cloudflare chat upstream');
+  }
   const routes = resolveUpstreams(config);
   const upstream = routes.anthropic;
   const openAIUpstream = routes.openai;
@@ -611,6 +675,28 @@ export function createProxy(config: ProxyConfig = {}) {
     const t0 = Date.now();
     const url = new URL(req.url);
     const path = url.pathname + url.search;
+
+    // Reversibly disguise the configured upstream id for Claude Code's model
+    // picker, matching CLIProxyAPI. The id decodes back to the exact provider
+    // model on /v1/messages, so discovery and routing cannot drift apart.
+    if (req.method === 'GET' && url.pathname === '/v1/models'
+        && config.cloudflareUpstream !== undefined) {
+      const configuredModels = config.cloudflareModels?.filter(Boolean) ?? [];
+      const models = configuredModels.map((model) => ({
+            id: claudeGatewayModelId(model),
+            type: 'model',
+            display_name: cloudflareModelDisplayName(model),
+            created_at: '1970-01-01T00:00:00Z',
+          }));
+      return new Response(JSON.stringify({
+        data: models,
+        has_more: false,
+        first_id: models[0]?.id ?? '',
+        last_id: models.at(-1)?.id ?? '',
+      }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
 
     // reqBodyBytes: kept for lazy gzip on 4xx. reqBodySha8: computed eagerly for correlation.
     let reqBodyBytes: Uint8Array | undefined;
@@ -630,7 +716,7 @@ export function createProxy(config: ProxyConfig = {}) {
       // Gzip body lazily (only on 4xx). Async IIFE keeps fire() synchronous.
       const finalize = async (): Promise<void> => {
         let reqBodyGz: Uint8Array | undefined;
-        if (is4xx && reqBodyBytes && reqBodyBytes.byteLength > 0) {
+        if (config.captureErrorReqBody && is4xx && reqBodyBytes && reqBodyBytes.byteLength > 0) {
           try {
             reqBodyGz = await gzipBytes(reqBodyBytes);
           } catch {
@@ -670,15 +756,33 @@ export function createProxy(config: ProxyConfig = {}) {
             info.baselineProbeStatus = 'ok';
           }
         }
+        // The Messages compatibility response exposes Anthropic's disjoint
+        // usage buckets to the client. Dashboard accounting still needs the
+        // original Responses semantics: input includes the cached subset.
+        const eventUsage = bridgedGptMessages && usage
+          ? {
+              ...usage,
+              input_tokens: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0),
+              cached_tokens: usage.cache_read_input_tokens ?? 0,
+            }
+          : usage;
         await config.onRequest?.({
           method: req.method,
           path: url.pathname,
           model: requestModel,
+          // Provider-prefixed OpenCode routes such as `/openai/responses` are
+          // Responses-shaped even though they are not canonical `/v1/*` paths.
+          // Classify by the parsed wire route, otherwise the dashboard ignores
+          // GPT image/baseline telemetry and renders As text / Saved as dashes.
+          accountingProvider:
+            isOpenAIChat || isOpenAIResponses || bridgedGptMessages || bridgedChatMessages
+              ? 'openai'
+              : 'anthropic',
           status,
           durationMs: Date.now() - t0,
           firstByteMs,
           info,
-          usage,
+          usage: eventUsage,
           error,
           errorBody,
           reqBodySha8,
@@ -705,6 +809,9 @@ export function createProxy(config: ProxyConfig = {}) {
     let bodyOut: BodyInit | null = null;
     let info: TransformInfo | undefined;
     let requestModel: string | undefined;
+    let bridgedGptMessages = false;
+    let bridgedChatMessages = false;
+    let modelRouteForRequest: 'openai' | 'cloudflare' | undefined;
 
     // Two count_tokens probes on the pre-compression body (see docs/HISTORY_CACHE_MODEL.md):
     //   baselinePromise          → full-body input_tokens
@@ -722,16 +829,52 @@ export function createProxy(config: ProxyConfig = {}) {
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = readModelField(bodyIn);
         requestModel = model ?? undefined;
+        // /v1/messages is only a wire schema: Claude Code can target a non-
+        // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
+        // renderer or Anthropic count_tokens merely because the route is
+        // Messages-shaped. Enabled GPT models take the standalone
+        // Messages→Responses bridge; unsupported models still fail closed.
+        // Claude Code model aliases decode back to exact Cloudflare model IDs.
+        const decodedByAlias = [...modelRoutes.keys()]
+          .find((candidate) => claudeGatewayModelId(candidate) === model);
+        const decodedChatModel = decodedByAlias ?? resolveClaudeGatewayModelId(model);
+        const routedModel = decodedChatModel ?? model;
+        const modelRoute = routedModel ? modelRoutes.get(routedModel) : undefined;
+        modelRouteForRequest = modelRoute;
+        const forceChat = isMessages && modelRoute === 'cloudflare';
+        const messagesAnthropic = isMessages
+          && modelRoute === undefined && !forceChat && isClaudeModel(model);
+        // Provider routing is explicit. Unlisted Messages models use the
+        // default Anthropic route, regardless of how their id is shaped.
+        bridgedGptMessages =
+          isMessages && !messagesAnthropic && !forceChat
+          && modelRoute === 'openai';
+        // Messages → Chat Completions bridge toward Cloudflare Workers AI.
+        bridgedChatMessages = forceChat;
+        const chatStamp = bridgedChatMessages ? routedModel : undefined;
+        const effectiveModel = chatStamp ?? model;
         const modelOk = isMessages
-          ? isPxpipeSupportedModel(model)
+          ? (messagesAnthropic && isPxpipeSupportedModel(model))
+            || bridgedGptMessages
+            || (bridgedChatMessages && isPxpipeSupportedGptModel(effectiveModel))
           : isPxpipeSupportedGptModel(model);
-        // Unsupported model → a true passthrough: no break-even compression
-        // (a text-only model may not accept injected image blocks at all).
+        // Compression eligibility and telemetry follow the model that actually
+        // receives the request, not Claude Code's local gateway alias.
+        if (bridgedChatMessages && effectiveModel) requestModel = effectiveModel;
         const effectiveOpts = modelOk
           ? transformOpts
           : { ...transformOpts, compress: false };
+        const bridgeBody = bridgedGptMessages
+          ? anthropicMessagesToOpenAIResponses(bodyIn)
+          : bridgedChatMessages
+            ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
+            : bodyIn;
         const r = isMessages
-          ? await transformRequest(bodyIn, effectiveOpts)
+          ? bridgedGptMessages
+            ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
+            : bridgedChatMessages
+              ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
+              : await transformRequest(bodyIn, effectiveOpts)
           : isOpenAIChat
             ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
             : await transformOpenAIResponses(bodyIn, effectiveOpts);
@@ -743,7 +886,7 @@ export function createProxy(config: ProxyConfig = {}) {
           reqBodySha8 = await sha8Bytes(r.body);
         }
 
-        if (isMessages) {
+        if (isMessages && messagesAnthropic) {
           baselineStatusApplies = true;
           // Probes fire on the ORIGINAL body before the main forward so all three overlap.
           // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
@@ -770,6 +913,13 @@ export function createProxy(config: ProxyConfig = {}) {
           }
         }
       } catch (e) {
+        if ((bridgedGptMessages || bridgedChatMessages) && (e as Error).name === 'MessagesBridgeInvalidRequest') {
+          fire(400, undefined, `invalid_request: ${(e as Error).message}`);
+          return new Response(JSON.stringify({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: (e as Error).message },
+          }), { status: 400, headers: { 'content-type': 'application/json' } });
+        }
         fire(502, undefined, `transform_error: ${(e as Error).message}`);
         return new Response(JSON.stringify({ error: 'pxpipe transform failed' }), {
           status: 502,
@@ -781,8 +931,21 @@ export function createProxy(config: ProxyConfig = {}) {
     }
 
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
-    if (isOpenAIPath) {
-      if (config.openAIApiKey) outHeaders.set('authorization', `Bearer ${config.openAIApiKey}`);
+    if (isOpenAIPath || bridgedGptMessages || bridgedChatMessages) {
+      outHeaders.delete('x-api-key');
+      // Never forward a Messages client's bearer credential across providers.
+      // A configured upstream key is installed below; otherwise auth stays absent.
+      if (bridgedGptMessages || bridgedChatMessages) outHeaders.delete('authorization');
+      const anthropicHeaders: string[] = [];
+      outHeaders.forEach((_value, name) => {
+        if (name.toLowerCase().startsWith('anthropic-')) anthropicHeaders.push(name);
+      });
+      for (const name of anthropicHeaders) outHeaders.delete(name);
+      // The chat bridge uses the Cloudflare token; Responses uses the OpenAI key.
+      const bridgeKey = bridgedChatMessages
+        ? config.cloudflareApiKey
+        : config.openAIApiKey;
+      if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
     } else if (config.apiKey && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))) {
       outHeaders.set('x-api-key', config.apiKey);
     }
@@ -792,8 +955,20 @@ export function createProxy(config: ProxyConfig = {}) {
     // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
     // routes keep their full path so ocproxy-style upstreams see `/openai/*`,
     // `/google-ai-studio/*`, etc. exactly as the client sent them.
-    const outPath = isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
-    const upstreamUrl = upstreamBase + outPath;
+    // The chat bridge forwards to the configured Cloudflare upstream at its
+    // /chat/completions endpoint (chatCompletionsUrl normalizes a bare base,
+    // a /v1 base, or a full …/chat/completions URL). Every other route appends
+    // a path to its resolved base.
+    let upstreamUrl: string;
+    if (bridgedChatMessages) {
+      upstreamUrl = chatCompletionsUrl(config.cloudflareUpstream ?? '');
+    } else {
+      const outPath = bridgedGptMessages
+        ? (routes.stripOpenAIV1 ? '/responses' : '/v1/responses')
+        : isOpenAIPath && routes.stripOpenAIV1 ? path.replace(/^\/v1(?=\/)/, '') : path;
+      const requestUpstreamBase = bridgedGptMessages ? openAIUpstream : upstreamBase;
+      upstreamUrl = requestUpstreamBase + outPath;
+    }
     let upstreamRes: Response;
     try {
       upstreamRes = await fetch(upstreamUrl, {
@@ -803,6 +978,11 @@ export function createProxy(config: ProxyConfig = {}) {
         // duplex is required by spec when sending a stream as body
         ...(bodyOut instanceof ReadableStream ? { duplex: 'half' } : {}),
       } as RequestInit);
+      if (bridgedGptMessages) {
+        upstreamRes = await openAIResponsesToAnthropicResponse(upstreamRes, requestModel ?? '');
+      } else if (bridgedChatMessages) {
+        upstreamRes = await openAIChatToAnthropicResponse(upstreamRes, requestModel ?? '');
+      }
     } catch (e) {
       fire(502, info, `upstream_error: ${(e as Error).message}`);
       return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {

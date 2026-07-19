@@ -15,6 +15,7 @@ import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicab
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
+import { renderHeaderFragment, renderPage } from '../src/dashboard/fragments.js';
 
 function makeTmp(): SessionsPaths {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
@@ -53,6 +54,7 @@ beforeEach(() => {
   dash = new DashboardState(tmp, async () => new Map());
 });
 afterEach(() => {
+  setAllowedModelBases(null);
   try {
     fs.rmSync(path.dirname(tmp.eventsFile), { recursive: true, force: true });
   } catch {
@@ -176,27 +178,56 @@ describe('serveFragment', () => {
     dash.handleCompressionToggle({ enabled: true });
   });
 
-  it('renders and mutates GPT 5.5/5.6 chips via the single model scope', async () => {
+  it('renders opt-in GPT 5.5/5.6 chips and mutates the single model scope', async () => {
     const prev = process.env.PXPIPE_MODELS;
     try {
       delete process.env.PXPIPE_MODELS;
-      setAllowedModelBases(null); // reset to built-in default (Fable 5 + GPT 5.6)
-      const on = await (await dash.serveFragment('models', url, 1234)).text();
-      expect(on).toContain('Image GPT models');
-      // GPT 5.6 is on by default; GPT 5.5 is opt-in (off until toggled).
-      expect(on).toContain('GPT 5.6 ✓');
-      expect(on).toContain('GPT 5.5</button>');
-      // GPT 5.6 renders to the left of GPT 5.5.
-      expect(on.indexOf('GPT 5.6')).toBeLessThan(on.indexOf('GPT 5.5'));
-      expect(getAllowedModelBases()).toContain('gpt-5.6');
+      setAllowedModelBases(null); // reset to built-in Fable-only default
+      const off = await (await dash.serveFragment('models', url, 1234)).text();
+      expect(off).toContain('Image OpenAI Responses models');
+      expect(off).not.toContain('<div class="models" style="display:none">');
+      // PXPIPE_MODELS textbox mirrors the live scope as CSV.
+      expect(off).toContain('name="list"');
+      expect(off).toContain('value="claude-fable-5"');
+      expect(off).toContain('GPT 5.6 Sol</button>');
+      expect(off).toContain('GPT 5.5</button>');
+      // Sol remains available and ordered before GPT 5.5.
+      expect(off.indexOf('GPT 5.6 Sol')).toBeLessThan(off.indexOf('GPT 5.5'));
+      expect(getAllowedModelBases()).toContain('claude-fable-5');
+      expect(getAllowedModelBases()).not.toContain('grok-4.5');
+      expect(getAllowedModelBases()).not.toContain('gpt-5.6-sol');
       expect(getAllowedModelBases()).not.toContain('gpt-5.5');
 
+      dash.handleModelsToggle('gpt-5.6-sol', true);
       dash.handleModelsToggle('gpt-5.5', true);
       const onBoth = await (await dash.serveFragment('models', url, 1234)).text();
       expect(onBoth).toContain('GPT 5.5 ✓');
-      expect(onBoth).toContain('GPT 5.6 ✓');
+      expect(onBoth).toContain('GPT 5.6 Sol ✓');
       expect(getAllowedModelBases()).toContain('gpt-5.5');
-      expect(getAllowedModelBases()).toContain('gpt-5.6');
+      expect(getAllowedModelBases()).toContain('gpt-5.6-sol');
+      // Chip flips are reflected back into the textbox CSV.
+      expect(onBoth).toContain('value="claude-fable-5,gpt-5.6-sol,gpt-5.5"');
+    } finally {
+      setAllowedModelBases(null);
+      if (prev === undefined) delete process.env.PXPIPE_MODELS;
+      else process.env.PXPIPE_MODELS = prev;
+    }
+  });
+
+  it('replaces the whole scope from the PXPIPE_MODELS textbox CSV', async () => {
+    const prev = process.env.PXPIPE_MODELS;
+    try {
+      delete process.env.PXPIPE_MODELS;
+      dash.handleModelsSet(' claude-fable-5 , grok-4.5 ,');
+      expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'grok-4.5']);
+      const html = await (await dash.serveFragment('models', url, 1234)).text();
+      expect(html).toContain('value="claude-fable-5,grok-4.5"');
+      expect(html).toContain('Grok 4.5 ✓');
+      // Same falsey vocabulary as the env var: off/false/0 → compress nothing.
+      dash.handleModelsSet('off');
+      expect(getAllowedModelBases()).toEqual([]);
+      dash.handleModelsSet('');
+      expect(getAllowedModelBases()).toEqual([]);
     } finally {
       setAllowedModelBases(null);
       if (prev === undefined) delete process.env.PXPIPE_MODELS;
@@ -218,6 +249,65 @@ describe('serveFragment', () => {
     expect(stats).toContain('requests');
   });
 
+  it('shows the OpenAI Responses composition in request Details', async () => {
+    dash.update({
+      method: 'POST', path: '/v1/responses', model: 'gpt-5.6-sol', status: 200,
+      durationMs: 1,
+      usage: { input_tokens: 500000, output_tokens: 10, cached_tokens: 490000 },
+      info: {
+        compressed: true, imageCount: 1, imagePngs: [new Uint8Array([1])],
+        imageDims: [{ width: 10, height: 10 }], imageTokens: 15000,
+        baselineImagedTokens: 56000, bucketChars: { history: 200000 },
+        responsesComposition: {
+          instructions: 1000, systemDeveloper: 2000, userAssistant: 450000,
+          functionCalls: 1000, functionOutputs: 20000, reasoningEncrypted: 5000,
+          compactionOpaque: 3000, toolsJson: 12000, other: 1000,
+          totalLocal: 495000, imageParts: 0,
+          completedFunctionPairs: 25, recentNativeFunctionPairs: 6,
+          oldFunctionPairs: 19, openFunctionCalls: 1,
+          imageableFunctionCalls: 900, imageableFunctionOutputs: 19000,
+          collapsedFunctionPairs: 10, collapsedFunctionCalls: 500,
+          collapsedFunctionOutputs: 12000,
+        },
+      } as never,
+    });
+    const html = await (await dash.serveFragment('context-map', new URL('http://localhost/fragments/context-map'), 1)).text();
+    expect(html).toContain('Original Responses composition');
+    expect(html).toContain('Reasoning / encrypted items');
+    expect(html).toContain('Native tool JSON');
+    expect(html).toContain('Function outputs eligible in old closed pairs');
+    expect(html).toContain('Function outputs actually imaged this request');
+    expect(html).toContain('Adjacent completed pairs');
+    expect(html).toContain('Open calls kept native');
+    expect(html).toContain('56.0k tok');
+    expect(html).toContain('sent to gpt-5.6-sol');
+    expect(html).toContain('Model reply (output)');
+    expect(html).toContain('never calls Anthropic /count_tokens');
+  });
+
+  it('renders keyboard-accessible hover help for stat question marks', async () => {
+    const header = await (await dash.serveFragment('header', url, 4711)).text();
+    expect(header).toContain('class="q" tabindex="0"');
+    expect(header).toContain('data-tip=');
+    expect(header).toContain('aria-label=');
+  });
+
+  it('uses source text parallel to each captured PNG', async () => {
+    const ids = dash.captureImage({
+      imagePngs: [new Uint8Array([1]), new Uint8Array([2])],
+      imageDims: [{ width: 10, height: 10 }, { width: 20, height: 20 }],
+      imageSourceText: 'legacy shared',
+      imageSourceTexts: ['slab source', 'history section source'],
+    } as never);
+    const html = await (await dash.serveFragment(
+      'latest',
+      new URL(`http://localhost/fragments/latest?source=1&pin=${ids[1]}`),
+      1,
+    )).text();
+    expect(html).toContain('history section source');
+    expect(html).not.toContain('slab source');
+  });
+
   it('escapes HTML in latest source text', async () => {
     dash.captureImage({
       imagePngs: [new Uint8Array([137, 80, 78, 71])],
@@ -236,12 +326,42 @@ describe('serveFragment', () => {
   });
 });
 
+describe('dashboard page help UI', () => {
+  it('ships visible hover/focus tooltip CSS for question-mark controls', () => {
+    const html = renderPage(47821);
+    expect(html).toContain('.q:hover::after, .q:focus-visible::after');
+    expect(html).toContain('content: attr(data-tip)');
+  });
+
+  it('compares imaged requests with their own without-pxpipe counterfactual', () => {
+    const html = renderHeaderFragment({
+      compressed_paid_requests: 600,
+      compressed_actual_usd: 96.42,
+      compressed_avg_usd_per_request: 0.1607,
+      passthrough_paid_requests: 36,
+      passthrough_actual_usd: 2.5992,
+      passthrough_avg_usd_per_request: 0.0722,
+      saved_usd: 194.83,
+      pricing_assumptions: { input_per_mtok: 10, output_multiplier: 5 },
+    } as StatsPayload, 47821);
+
+    expect(html).toContain('$0.1607');
+    expect(html).toContain('vs $0.4854 without pxpipe');
+    expect(html).not.toContain('vs $0.0722 without pxpipe');
+    expect(html).toContain('same paid imaged requests');
+  });
+});
+
 // ---- GPT (OpenAI) savings split ------------------------------------------
 // The dashboard math was built entirely around the Anthropic cache-aware
 // baseline, so GPT rows used to surface all-zero columns. These lock the
 // GPT branch in update()/replay(): vision-token actual vs o200k text-token
 // baseline, 0.1× automatic prefix cache, no count_tokens probe.
 describe('GPT savings split', () => {
+  beforeEach(() => {
+    setAllowedModelBases(['gpt-5.5']);
+  });
+
   // Imaged 50k o200k text tokens down to 8k vision tokens, with a 2k cached
   // prefix served at 0.1×:
   //   actual   = (10000 - 2000) + 2000×0.1               = 8200
@@ -271,6 +391,29 @@ describe('GPT savings split', () => {
     expect(stats.baseline_input_weighted).toBe(12400);
     expect(stats.saved_input_tokens).toBe(4200);
     expect(stats.saved_pct_input_only).toBeGreaterThan(0);
+  });
+
+  it('includes only currently enabled models in overall stats', async () => {
+    dash.update(structuredClone(gptUpdate) as never);
+    dash.update({
+      ...structuredClone(gptUpdate),
+      model: 'gpt-5.6-sol',
+      info: { ...structuredClone(gptUpdate.info), firstUserSha8: 'gptsol' },
+    } as never);
+
+    let stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.requests).toBe(1);
+    expect(stats.saved_input_tokens).toBe(4200);
+
+    dash.handleModelsToggle('gpt-5.6-sol', true);
+    stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.requests).toBe(2);
+    expect(stats.saved_input_tokens).toBe(8400);
+
+    dash.handleModelsToggle('gpt-5.5', false);
+    stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.requests).toBe(1);
+    expect(stats.saved_input_tokens).toBe(4200);
   });
 
   it('populates As-text / Sent / Cache-hits / Saved recent columns for GPT', async () => {
@@ -325,6 +468,61 @@ describe('GPT savings split', () => {
     expect(recent.recent.at(-1)!.session_saved_so_far_delta ?? 0).toBe(0);
   });
 
+  it('uses the Anthropic 1-hour cache-write split in dashboard savings', async () => {
+    setAllowedModelBases(['claude-fable-5']);
+    dash.update({
+      method: 'POST', path: '/v1/messages', model: 'claude-fable-5-20260609', status: 200,
+      durationMs: 1,
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 0,
+        cache_creation_input_tokens: 2000,
+        cache_read_input_tokens: 0,
+        cache_creation: {
+          ephemeral_5m_input_tokens: 0,
+          ephemeral_1h_input_tokens: 2000,
+        },
+      },
+      info: {
+        compressed: true,
+        baselineTokens: 10000,
+        baselineCacheableTokens: 9000,
+        baselineProbeStatus: 'ok',
+        firstUserSha8: 'onehour',
+      },
+    } as never);
+
+    const stats = (await dash.serveStats().json()) as StatsPayload;
+    expect(stats.actual_input_weighted).toBe(5000);
+    expect(stats.baseline_input_weighted).toBe(19000);
+    expect(stats.saved_input_tokens).toBe(14000);
+    expect(stats.saved_usd).toBe(0.14);
+  });
+
+  it('replay() preserves Anthropic 1-hour cache-write accounting', async () => {
+    writeEvents(tmp, [
+      ev({
+        model: 'claude-fable-5-20260609',
+        compressed: true,
+        input_tokens: 1000,
+        cache_create_tokens: 2000,
+        cache_create_5m_tokens: 0,
+        cache_create_1h_tokens: 2000,
+        baseline_tokens: 10000,
+        baseline_cacheable_tokens: 9000,
+        baseline_probe_status: 'ok',
+        first_user_sha8: 'onehour-replay',
+      }),
+    ]);
+    await dash.replay(tmp.eventsFile);
+
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    expect(row.actual_input).toBe(5000);
+    expect(row.baseline_input).toBe(19000);
+    expect(row.session_saved_so_far_delta).toBe(14000);
+  });
+
   it('replay() reconstructs GPT recent rows byte-identically to the live path', async () => {
     writeEvents(tmp, [
       ev({
@@ -347,6 +545,52 @@ describe('GPT savings split', () => {
     expect(row.baseline_input).toBe(12400);
     expect(row.actual_input).toBe(8200);
     expect(row.session_saved_so_far_delta).toBe(4200);
+  });
+
+  it('uses OpenAI accounting for a bridged Sol Messages event and subtracts proxy overhead', async () => {
+    setAllowedModelBases(['gpt-5.6-sol']);
+    dash.update({
+      ...structuredClone(gptUpdate),
+      path: '/v1/messages',
+      accountingProvider: 'openai',
+      model: 'gpt-5.6-sol',
+      usage: { input_tokens: 10000, output_tokens: 200, cached_tokens: 2000 },
+      info: {
+        ...structuredClone(gptUpdate.info),
+        nativeInjectedTokens: 1000,
+        firstUserSha8: 'bridgedsol',
+      },
+    } as never);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    // actual=8200; baseline=8200+(50000-8000-1000)*0.1=12300
+    expect(row.actual_input).toBe(8200);
+    expect(row.baseline_input).toBe(12300);
+    expect(row.session_saved_so_far_delta).toBe(4100);
+  });
+
+  it('replays bridged Sol Messages with the same provider and overhead semantics', async () => {
+    setAllowedModelBases(['gpt-5.6-sol']);
+    writeEvents(tmp, [ev({
+      path: '/v1/messages',
+      accounting_provider: 'openai',
+      model: 'gpt-5.6-sol',
+      compressed: true,
+      input_tokens: 10000,
+      output_tokens: 200,
+      cached_tokens: 2000,
+      image_tokens: 8000,
+      baseline_imaged_tokens: 50000,
+      native_injected_tokens: 1000,
+      image_count: 1,
+      first_user_sha8: 'bridgedsol',
+    })]);
+    await dash.replay(tmp.eventsFile);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    const row = recent.recent.at(-1)!;
+    expect(row.actual_input).toBe(8200);
+    expect(row.baseline_input).toBe(12300);
+    expect(row.session_saved_so_far_delta).toBe(4100);
   });
 });
 

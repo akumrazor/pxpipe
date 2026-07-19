@@ -17,10 +17,27 @@
  *
  * Run just this file:  pnpm vitest run tests/cache-stability-e2e.test.ts
  */
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createProxy } from '../src/core/proxy.js';
 import { countCacheControlMarkers } from '../src/core/measurement.js';
 import { HISTORY_SYNTHETIC_INTRO } from '../src/core/history.js';
+import { resetEnvSplitState } from '../src/core/transform.js';
+
+// Pin the model scope so these proxy-contract tests stay independent of the developer shell.
+let ambientPxpipeModels: string | undefined;
+beforeAll(() => {
+  ambientPxpipeModels = process.env.PXPIPE_MODELS;
+  process.env.PXPIPE_MODELS = 'claude-fable-5,gpt-5.6-sol';
+});
+// The env split learns across sessions keyed by claudeMdSha, and every test
+// here shares the same `# CLAUDE.md` fixture slab — without a reset, an env
+// entry that one test proved stable would promote into the slab in a LATER
+// test's fresh session, changing what relocates to the tail.
+beforeEach(() => resetEnvSplitState());
+afterAll(() => {
+  if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
+  else process.env.PXPIPE_MODELS = ambientPxpipeModels;
+});
 
 // ---------------------------------------------------------------------------
 // Fake upstream — records every outbound MAIN request body and answers with a
@@ -406,6 +423,53 @@ describe('e2e cache alignment — Anthropic /v1/messages through the real proxy'
     );
   });
 
+  it('ENV RELOCATION: model-identity/catalog lines are redacted from the relocated block', async () => {
+    // Regression (2026 LinkedIn report): relocating `# Environment` into the
+    // LAST user message re-surfaced "You are powered by … Fable 5" and "default
+    // to the latest and most capable Claude models" as fresh per-turn guidance,
+    // exactly where the parent model chooses subagent models — subagents that
+    // should run on haiku were spawned on fable, and pxpipe INCREASED cost.
+    // Fix: redactModelIdentityLines on the relocation path (transform.ts). The
+    // rest of the env block (cwd, git, platform) must survive untouched.
+    const env =
+      `\n# Environment\nWorking directory: /repo\nPlatform: darwin\n` +
+      `You are powered by the model named Fable 5. The exact model ID is claude-fable-5.\n` +
+      `The most recent Claude models are the Claude 5 family, Opus 4.8, and Haiku 4.5. ` +
+      `When building AI applications, default to the latest and most capable Claude models.\n` +
+      `Git status:\nclean`;
+    const cap = await driveAnthropic(
+      anthropicBody({ slabChars: 80_000, sysSuffix: env, turns: turns(4, 20) }),
+    );
+    cap.restore();
+
+    const bodyText = cap.main[0]!.body;
+    const sys = JSON.parse(bodyText).system;
+    const sysStr = Array.isArray(sys)
+      ? sys.map((s: any) => s?.text ?? '').join('\n')
+      : String(sys ?? '');
+    const msgs = JSON.parse(bodyText).messages as Array<{ role: string; content: unknown }>;
+    const lastUser = [...msgs].reverse().find((x) => x.role === 'user')!;
+    const lastUserStr = Array.isArray(lastUser.content)
+      ? lastUser.content.map((c: any) => (c?.type === 'text' ? c.text : '')).join('\n')
+      : String(lastUser.content ?? '');
+
+    // Identity/catalog lines: gone from the relocated block — and not moved
+    // back into system either (they'd cache-bust the anchored prefix there).
+    for (const needle of [
+      'You are powered by',
+      'exact model ID is',
+      'most recent Claude models',
+      'default to the latest and most capable',
+    ]) {
+      expect(lastUserStr).not.toContain(needle);
+      expect(sysStr).not.toContain(needle);
+    }
+    // Non-identity env lines still reach the model on the live tail.
+    expect(lastUserStr).toContain('# Environment');
+    expect(lastUserStr).toContain('Working directory: /repo');
+    expect(lastUserStr).toContain('Git status:\nclean');
+  });
+
   it('FIRST COLLAPSE (turn-2 rewrite): no frozen chunk yet → anchor stays on the SLAB image', async () => {
     // With defaults (keepTail 4, minCollapsePrefix 10, freezeChunk 10) and a slab
     // (protectedPrefix 1), 15 messages give collapse range [1..11) = exactly 10 =
@@ -487,7 +551,7 @@ describe('e2e cache alignment — GPT (OpenAI) through the real proxy', () => {
     turns: { role: 'user' | 'assistant'; text: string }[];
   }): string {
     return JSON.stringify({
-      model: opts.model ?? 'gpt-5.6',
+      model: opts.model ?? 'gpt-5.6-sol',
       messages: [
         { role: 'system', content: slab(opts.systemChars) },
         ...opts.turns.map((t) => ({ role: t.role, content: t.text })),
@@ -500,7 +564,7 @@ describe('e2e cache alignment — GPT (OpenAI) through the real proxy', () => {
     turns: { role: 'user' | 'assistant'; text: string }[];
   }): string {
     return JSON.stringify({
-      model: 'gpt-5.6',
+      model: 'gpt-5.6-sol',
       instructions: slab(opts.systemChars),
       input: opts.turns.map((t) => ({ role: t.role, content: t.text })),
     });
@@ -557,21 +621,37 @@ describe('e2e cache alignment — GPT (OpenAI) through the real proxy', () => {
     expect(b.slice(0, a.length)).toEqual(a);
   });
 
-  it('responses APPEND-ONLY: the imaged prefix is byte-identical as the conversation grows', async () => {
-    const small = turns(30, 4000);
-    const cap1 = await driveGpt('/v1/responses', gptResponsesBody({ systemChars: 60_000, turns: small }));
+  it('responses APPEND-ONLY: completed-pair pages are byte-identical as native state grows', async () => {
+    const pairItems = (n: number, start = 0) => {
+      const out: Array<Record<string, unknown>> = [];
+      for (let i = start; i < start + n; i++) {
+        const id = `call_${i}`;
+        out.push({ type: 'function_call', call_id: id, name: 'read', arguments: `{\"path\":\"f${i}\"}` });
+        out.push({ type: 'function_call_output', call_id: id, output: `result ${i}: ${filler(4000)}` });
+      }
+      return out;
+    };
+    const body = (pairs: Array<Record<string, unknown>>) => JSON.stringify({
+      model: 'gpt-5.6-sol', instructions: slab(60_000),
+      input: [{ role: 'user', content: 'live request stays native' }, ...pairs],
+    });
+    const small = pairItems(70);
+    const cap1 = await driveGpt('/v1/responses', body(small));
     cap1.restore();
-    const cap2 = await driveGpt(
-      '/v1/responses',
-      gptResponsesBody({ systemChars: 60_000, turns: [...small, ...turns(20, 4000)] }),
-    );
+    const cap2 = await driveGpt('/v1/responses', body([...small, ...pairItems(20, 70)]));
     cap2.restore();
 
     const a = gptResponsesImages(cap1.main[0]!.body);
     const b = gptResponsesImages(cap2.main[0]!.body);
-    expect(a.length).toBeGreaterThan(1); // slab image + ≥1 sealed history page
-    expect(b.length).toBeGreaterThan(a.length); // growth sealed more pages
-    expect(b.slice(0, a.length)).toEqual(a);
+    expect(a.length).toBeGreaterThan(1); // slab image + ≥1 completed-pair page
+    // The static slab stays byte-identical. Pair sections deliberately reserve the
+    // newest six completed pairs as native, so appending pairs can move the exact
+    // old/native frontier even while every removed pair remains protocol-closed.
+    expect(b[0]).toBe(a[0]);
+    const parsed = JSON.parse(cap2.main[0]!.body);
+    const calls = new Set(parsed.input.filter((x: any) => x.type === 'function_call').map((x: any) => x.call_id));
+    const outputs = parsed.input.filter((x: any) => x.type === 'function_call_output');
+    expect(outputs.every((x: any) => calls.has(x.call_id))).toBe(true);
   });
 
   it('GATE: an out-of-scope GPT model is forwarded byte-for-byte untouched (no images)', async () => {

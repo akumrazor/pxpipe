@@ -4,6 +4,54 @@ All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).
 
+## 0.9.0 — 2026-07-14
+
+### Changed
+- `gpt-5.6-sol` is now opt-in rather than silently enabled. Its exact profile
+  remains available when selected, and sibling 5.6 variants do not inherit it.
+- Complete per-model render profiles now drive font atlas, cell spacing,
+  geometry, style, history pages, and profitability math. Sol uses a 6×11
+  JetBrains Mono atlas; opt-in Grok uses the measured effective 9×12 arm plus
+  the factsheet.
+- Dashboard exposes the GPT model row and `?` controls now show accessible
+  hover/focus tooltips.
+- Dashboard overall totals now include only currently enabled models. Traffic
+  from disabled models, including passthrough subagents, no longer affects the
+  headline numbers; re-enabling a model restores its retained history.
+
+### Fixed
+- **Env relocation no longer re-surfaces model-identity lines as per-turn
+  guidance.** The relocated `# Environment` block ("You are powered by …",
+  "default to the latest and most capable Claude models") landed in the LAST
+  user message every turn — exactly where the parent model picks subagent
+  models — steering `Agent` calls to fable instead of haiku and *increasing*
+  net cost for affected sessions. Root fix: a
+  diff-based static/volatile split (`splitEnvByVolatility`) learns, per
+  project (`claudeMdSha`), which env entries are byte-stable and promotes
+  them into the imaged slab — identity/catalog lines are stable, so from a
+  project's second session onward they ride the slab in their original
+  system-derived position instead of the per-turn tail. The identity-line
+  regex stays as a second layer for fresh sessions and churned entries.
+  Guarantees preserved: first-ever sightings stay volatile (git state never
+  bakes into a fresh session's image), the slab never re-renders mid-session
+  (the static side is frozen byte-exact; a churned entry re-emits fresh text
+  on the tail, superseding its stale slab copy, and demotes next session),
+  and the no-user-message fallback (env stays in system) is unchanged.
+  Stable entries now also stop paying live-text rates every turn; telemetry
+  reports the split via `envStaticChars` / `envVolatileKeys`.
+
+### Known limitations / evidence
+- A direct `gpt-5.6-sol` raw-image pilot tested **both** the new JetBrains
+  6×11/126-column profile and the old Spleen 5×8/152-column profile. Each scored
+  0/4 exact identifiers with four unsupported invented values; 6×11 passed
+  gist/guard, while 5×8 failed gist and passed the guard. One earlier paid setup
+  attempt exhausted 512 output tokens as hidden reasoning and is recorded but
+  excluded from scoring. The production fact-sheet still carries extracted
+  identifiers verbatim. Sol is therefore removed from the built-in default
+  scope while its exact profile remains available for explicit opt-in. A
+  Sol-only effective 9×12/84-column candidate is locally rendered but has no
+  model result yet. See `eval/sol-profile/RESULTS.md`.
+
 ## 0.8.0 — 2026-07-03
 
 ### Security
@@ -214,7 +262,8 @@ it were the live request).
 
 ## 0.5.0 — 2026-06-20
 
-Cache-stable history-collapse imaging for both providers, with GPT-5.6 promoted
+Cache-stable history-collapse imaging for both providers, with the then-named
+GPT-5.6 model promoted
 to the default imaged scope. Old conversation history collapses into rendered
 PNG sections so the model reads a compact image instead of re-billed text, while
 prompt caching and tool-call behavior are preserved.
@@ -228,7 +277,13 @@ prompt caching and tool-call behavior are preserved.
   metrics, thumbnail-expired session UI, and reflow/newline handling.
 
 ### Changed
-- **Default imaged scope is now `claude-fable-5` + `gpt-5.6`.** GPT-5.6 is
+> Historical state for 0.5.0: the Sol promotion below was reversed in the
+> current Unreleased changes after the 2026-07-09 raw-recall failures; the
+> built-in default is now Fable-only.
+
+- **Default imaged scope is now `claude-fable-5` + `gpt-5.6-sol`.** The model
+  was originally recorded here as GPT-5.6; production traffic identifies the
+  exact variant as `gpt-5.6-sol`. GPT-5.6 Sol is
   promoted from opt-in (0.4.0) to on by default. `gpt-5.5` and `claude-opus-4-8`
   stay opt-in: they degrade reading dense imaged history (gist drift), so
   silently imaging them by default is wrong. Promotion is gated on an OCR/recall

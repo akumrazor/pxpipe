@@ -32,6 +32,7 @@ import {
   DENSE_CONTENT_CHARS_PER_IMAGE,
   DENSE_CONTENT_COLS,
   DENSE_RENDER_STYLE,
+  ANTHROPIC_SLAB_COLS,
   renderTextToPngsWithCharLimit,
 } from './render.js';
 import { factSheetText } from './factsheet.js';
@@ -40,6 +41,7 @@ import { bytesToBase64 } from './png.js';
 import { collapseHistory, HISTORY_SYNTHETIC_INTRO } from './history.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
+import { patchTokens } from './anthropic-vision.js';
 
 /** Per-block descriptor passed to `TransformOptions.keepSharp`. */
 export interface KeepSharpBlock {
@@ -134,14 +136,14 @@ const DEFAULTS: Required<TransformOptions> = {
   minToolResultChars: 6000,
   // system field rejects images (400 system.N.type: Input should be 'text') —
   // images always go into the first user message.
-  // 313 cols × 5 px + 8 px pad = 1573 px slab width (under 2000 px ceiling).
-  cols: 313,
+  // 312 cols × 5 px + 8 px pad = 1568 px (Anthropic no-resize edge).
+  cols: ANTHROPIC_SLAB_COLS,
   maxImagesPerToolResult: 10,
   charsPerToken: 4,
   historyAmortizationHorizon: 1,
   priorWarmTokens: 0,
   priorWarmImageTokens: 0,
-  // Multi-col off: single-col slab already holds ~50k chars; extra OCR risk not worth it.
+  // Multi-col off: single-col slab already holds ~28k chars/page at the 1568×728 cap; extra OCR risk not worth it.
   multiCol: 1,
   reflow: true,
   keepSharp: () => false,
@@ -151,13 +153,21 @@ const DEFAULTS: Required<TransformOptions> = {
   gptHistory: {},
 };
 
+/**
+ * Subscription OAuth requests are classified as Claude Code traffic only when
+ * this exact identity remains the first, separate top-level system block.
+ * Never render it into an image or concatenate other text into its block.
+ */
+export const CLAUDE_CODE_OAUTH_IDENTITY =
+  "You are Claude Code, Anthropic's official CLI for Claude.";
+
 // --- per-block break-even check ---
 //
-// Image token cost is computed from pixel area (Anthropic formula: w×h/750,
-// empirically accurate to ~5% on dense PNGs). Constants bias CONSERVATIVE:
-// CHARS_PER_TOKEN=4 under-estimates text savings; multi-col cost is linearly
-// scaled from single-col + 10% margin. Mispredictions leave money on the
-// table; they never generate net-loss images.
+// Image token cost uses Anthropic's documented 28-px patch model (see
+// src/core/anthropic-vision.ts). Constants bias CONSERVATIVE: CHARS_PER_TOKEN=4
+// under-estimates text savings; the gate multiplies the patch count by
+// ANTHROPIC_GATE_MARGIN on top. Mispredictions leave money on the table; they
+// never generate net-loss images.
 
 /** English ~4 chars per token average (conservative for code/JSON content). */
 const CHARS_PER_TOKEN = 4;
@@ -180,16 +190,11 @@ export const HISTORY_CHARS_PER_TOKEN = 2.0;
  *  of truth — src/core/export.ts imports this rather than redefining it. */
 export const REPORT_CHARS_PER_TOKEN = 3.7;
 
-/** Anthropic image-billing formula: `tokens ≈ width × height / 750`.
- *  https://docs.anthropic.com/en/docs/build-with-claude/vision#image-tokens
- *  Accurate to ~5% on dense glyph PNGs (N=14 empirical calibration). The renderer
- *  sizes height to content, so per-block images cost far less than full-canvas.
- *  Exported so the export pipeline can reuse the same constant rather than hardcoding. */
-export const ANTHROPIC_PIXELS_PER_TOKEN = 750;
-/** Conservative 10% upward bias on Anthropic image token estimates — keeps the gate
- *  on the safe (pass-through) side when the true cost is near the break-even point.
- *  Exported so the export pipeline reuses the same value. */
-export const IMAGE_COST_SAFETY_MARGIN = 1.10;
+/** Gate-only conservatism: a 10% upward bias on the patch-count image estimate,
+ *  keeping the gate on the safe (pass-through) side near break-even. This is NOT
+ *  part of Anthropic's documented cost — the documented per-image formula lives in
+ *  `anthropicVisionTokens` (anthropic-vision.ts); this margin only tunes the gate. */
+export const ANTHROPIC_GATE_MARGIN = 1.10;
 
 /** Width in px of a single-col PNG. Must stay in sync with `renderChunkToPng` (render.ts). */
 function singleColWidthPx(cols: number): number {
@@ -232,8 +237,12 @@ function imageTokensForRows(
   const rowsInLast = Math.min(Math.max(1, linesInLast), rowsPerImage);
   const fullImageHeight = 2 * PAD_Y + rowsPerImage * CELL_H;
   const lastImageHeight = 2 * PAD_Y + rowsInLast * CELL_H;
-  const totalPixels = fullImages * widthPx * fullImageHeight + widthPx * lastImageHeight;
-  return Math.ceil((totalPixels / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
+  // Anthropic bills per-image by 28-px patches (not by summed pixel area), so
+  // count each image separately. pxpipe pages are ≤ 1568×728, so no tier
+  // downscale applies and the raw patch count is tier-agnostic.
+  const patchSum =
+    fullImages * patchTokens(widthPx, fullImageHeight) + patchTokens(widthPx, lastImageHeight);
+  return Math.ceil(patchSum * ANTHROPIC_GATE_MARGIN);
 }
 
 /** Exact image-token cost for `text`. Uses `countVisualRows` and optionally
@@ -508,9 +517,40 @@ export interface TransformInfo {
    *  the would-have-paid "as plain text" baseline. Compared against imageTokens
    *  for the per-request saving. See src/core/openai-savings.ts. */
   baselineImagedTokens?: number;
+  /** GPT only. Local o200k tokens added solely by pxpipe (pointers, exact-token
+   * sheets, and framing). Removed from the unproxied counterfactual. */
+  nativeInjectedTokens?: number;
   /** Total TEXT chars in the outgoing body (system + messages, excluding image base64).
    *  Denominator for empirical chars-per-token regression on cold-miss events. */
   outgoingTextChars?: number;
+  /** OpenAI Responses only: local o200k decomposition of the ORIGINAL request
+   *  before pxpipe rewrites it. No provider count_tokens call. Categories are
+   *  mutually exclusive text-token estimates; imageParts counts native images. */
+  responsesComposition?: {
+    instructions: number;
+    systemDeveloper: number;
+    userAssistant: number;
+    functionCalls: number;
+    functionOutputs: number;
+    reasoningEncrypted: number;
+    compactionOpaque: number;
+    toolsJson: number;
+    other: number;
+    totalLocal: number;
+    imageParts: number;
+    /** Responses native-tool-state classification and realized image share. */
+    completedFunctionPairs?: number;
+    recentNativeFunctionPairs?: number;
+    oldFunctionPairs?: number;
+    openFunctionCalls?: number;
+    orphanFunctionOutputs?: number;
+    malformedFunctionItems?: number;
+    imageableFunctionCalls?: number;
+    imageableFunctionOutputs?: number;
+    collapsedFunctionPairs?: number;
+    collapsedFunctionCalls?: number;
+    collapsedFunctionOutputs?: number;
+  };
   /** Length of the static (cacheable) slab rendered into the image. */
   staticChars: number;
   /** Length of the dynamic (per-turn) slab kept as plain text. */
@@ -525,6 +565,10 @@ export interface TransformInfo {
   /** Static-slab tags whose content changed within a session — proven dynamic,
    *  busting the image cache each turn. The real alert signal. */
   churningStaticTags?: string[];
+  /** `# Environment` entries that rode the live tail this turn (diff split). */
+  envVolatileKeys?: string[];
+  /** Chars of `# Environment` entries promoted into the imaged slab. */
+  envStaticChars?: number;
   env?: EnvFields;
   /** sha8 of static slab + tool docs (what goes in the image). Repeats across turns → cache hits. */
   systemSha8?: string;
@@ -539,8 +583,11 @@ export interface TransformInfo {
   /** All rendered PNGs this request. Dashboard only; NOT persisted to JSONL. */
   imagePngs?: Uint8Array[];
   imageDims?: Array<{ width: number; height: number }>;
-  /** Source text rendered to images (slab + header), capped at 64 KiB. NOT persisted. */
+  /** Legacy shared source text for one render group. Dashboard-only; not persisted. */
   imageSourceText?: string;
+  /** Source text parallel to imagePngs/imageDims. One entry per PNG; a multi-page
+   *  render may repeat its section source. Dashboard-only; not persisted. */
+  imageSourceTexts?: Array<string | undefined>;
   reminderImgs?: number;
   toolResultImgs?: number;
   /** Chars of tool docs moved to the system-text Tool Reference (not imaged). */
@@ -621,11 +668,18 @@ export interface TransformInfo {
 function extractSystemText(sys: SystemField | undefined): { text: string; kept: SystemField } {
   if (sys == null) return { text: '', kept: [] };
   if (typeof sys === 'string') return { text: sys, kept: '' };
+  const hasCacheControlledText = sys.some(
+    (block) => block && block.type === 'text' && block.cache_control !== undefined,
+  );
   const textParts: string[] = [];
   const kept: SystemField = [];
   for (const block of sys) {
     if (block && typeof block === 'object' && block.type === 'text') {
-      textParts.push(block.text);
+      if (!hasCacheControlledText || block.cache_control !== undefined) {
+        textParts.push(block.text);
+      } else {
+        kept.push(block);
+      }
     } else {
       kept.push(block);
     }
@@ -646,6 +700,24 @@ function lastStaticSystemCacheControl(sys: SystemField | undefined): TextBlock['
   return cacheControl;
 }
 
+/**
+ * pxpipe relocates caller cache_control markers onto rendered image blocks.
+ * A relocated position is never a guaranteed "global prefix": pages 1..N-1 of
+ * a slab run and other pxpipe-injected blocks carry no marker, so a relocated
+ * `scope:"global"` violates Anthropic's "every preceding block must be
+ * globally scoped" rule and the whole request 400s (#95). Downgrade to plain
+ * ephemeral by dropping `scope` — a single trailing marker is always valid for
+ * ordinary ephemeral caching. `type`/`ttl` are preserved, and markers without
+ * `scope` pass through untouched (identity, so byte-stability is unaffected).
+ */
+function demoteRelocatedCacheControl<T>(cc: T): T {
+  if (cc && typeof cc === 'object' && 'scope' in (cc as object)) {
+    const { scope: _scope, ...rest } = cc as Record<string, unknown>;
+    return rest as T;
+  }
+  return cc;
+}
+
 // Per-turn dynamic blocks injected by Claude Code. These drift turn-to-turn and
 // must not be baked into the cached image. Split out so only the stable static
 // slab (CLAUDE.md + tool docs) carries cache_control.
@@ -663,6 +735,12 @@ const DYNAMIC_BLOCK_TAGS = [
 const KNOWN_STATIC_TAGS = [
   // Claude Code
   'types',
+  // Nested under <available_skills> (static for a session; churn still observed)
+  'skill',
+  'name',
+  'description',
+  'location',
+  'available_references',
   // opencode (codex system prompts have no tag-shaped blocks)
   'example',
   'available_skills',
@@ -880,7 +958,7 @@ function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrd
   }
   if (!slabAnchor) return; // nothing to relocate → never add a marker
 
-  historyImg.cache_control = slabAnchor.cache_control;
+  historyImg.cache_control = demoteRelocatedCacheControl(slabAnchor.cache_control);
   delete slabAnchor.cache_control;
 }
 
@@ -1017,13 +1095,187 @@ function stripBillingLine(text: string): { kept: string | null; body: string } {
  *  wrapper, so splitStaticDynamic can't catch it — yet its git-status lines
  *  change across sessions, and baking them into the slab PNG busts the cross-
  *  session cache (system_sha8 717f1fce → 5efaa4bb for a one-file edit). Parallel
- *  to stripBillingLine: `kept` re-enters the system tail as plain text. */
+ *  to stripBillingLine: `kept` re-enters the system tail as plain text — after
+ *  splitEnvByVolatility routes its proven-stable entries into the slab. */
 function stripMarkdownEnvSection(text: string): { kept: string; body: string } {
   const m = /(?:^|\n)(# Environment\b[\s\S]*?)(?=\n#{1,6}\s|$)/.exec(text);
   if (!m) return { kept: '', body: text };
   return {
     kept: m[1]!.trimEnd(),
     body: text.slice(0, m.index) + text.slice(m.index + m[0].length),
+  };
+}
+
+/** Model-identity/catalog lines dropped from RELOCATED env text (field report,
+ *  2026-07: higher spend with pxpipe because subagents ran on the parent model).
+ *  In the system prompt these lines are static low-salience context; appended to
+ *  the LAST user message every turn they read as fresh instructions at the exact
+ *  point where the model picks a subagent model — "default to the latest and
+ *  most capable Claude models" right next to an Agent call means fable, not
+ *  haiku. The live model already knows its identity from its own system prompt,
+ *  so relocation loses nothing. Redaction applies ONLY on the relocation path;
+ *  the no-user-message fallback keeps env text in system, where these lines
+ *  keep their original (harmless) position.
+ *
+ *  Since the diff-based split (splitEnvByVolatility) this regex is the SECOND
+ *  layer: identity entries are byte-stable, so from a session's second project
+ *  sighting onward they ride the imaged slab in their original system-derived
+ *  position and never reach this filter. It still guards the tail for fresh
+ *  sessions/projects and for entries that churn (e.g. a /model switch). */
+const MODEL_IDENTITY_LINE =
+  /you are powered by|exact model id is|most recent claude models|default to the latest and most capable/i;
+
+function redactModelIdentityLines(text: string): string {
+  return text
+    .split('\n')
+    .filter((line) => !MODEL_IDENTITY_LINE.test(line))
+    .join('\n');
+}
+
+/* ── Diff-based static/volatile `# Environment` split ──────────────────────
+ * The env section is mostly session-static (cwd, platform, OS, model catalog)
+ * with a few churning entries (git state). Blanket relocation to the per-turn
+ * tail is cache-safe but pays live-text rates every turn for bytes that never
+ * change. The split promotes entries PROVEN stable into the imaged slab and
+ * keeps the rest on the tail. Invariants (pinned by cache-stability e2e):
+ *   1. No promotion without history — a first-ever sighting is volatile, so a
+ *      fresh session/project never bakes git state into the image (the 48.8%
+ *      cold-create fix stays intact).
+ *   2. The slab NEVER re-renders mid-session — the static side is frozen
+ *      byte-exact at the session's first transform. If a promoted entry churns
+ *      anyway, the slab keeps its stale bytes and the fresh text re-emits on
+ *      the live tail (the later copy supersedes), while history marks it
+ *      churned so the NEXT session demotes it.
+ *   3. No project key (claudeMdSha absent) → no learning, all volatile: a
+ *      shared fallback key would let one project's stable sightings promote
+ *      another project's entries. */
+
+/** One env entry: a top-level bullet (` - Key: …`) or bare `Key: …` line plus
+ *  its deeper-indented continuation lines. */
+interface EnvEntry {
+  key: string;
+  hash: number;
+  text: string;
+}
+
+const ENV_ENTRY_START = /^ ?- (.{1,200})$|^([A-Za-z][^:\n]{0,63}):(?: |$)/;
+
+function parseEnvEntries(env: string): { header: string; entries: EnvEntry[] } {
+  const headerLines: string[] = [];
+  const entries: EnvEntry[] = [];
+  let cur: string[] | null = null;
+  let curKey = '';
+  const flush = () => {
+    if (cur) {
+      const text = cur.join('\n').trimEnd();
+      entries.push({ key: curKey, hash: fnv1a(text), text });
+    }
+    cur = null;
+  };
+  for (const line of env.split('\n')) {
+    const m = line.startsWith('#') ? null : ENV_ENTRY_START.exec(line);
+    if (m) {
+      flush();
+      const head = (m[1] ?? m[2] ?? '').trim();
+      curKey = head.split(':', 1)[0]!.slice(0, 64).trim();
+      cur = [line];
+    } else if (cur) {
+      cur.push(line); // continuation (nested list item / wrapped prose)
+    } else {
+      headerLines.push(line);
+    }
+  }
+  flush();
+  return { header: headerLines.join('\n').trimEnd(), entries };
+}
+
+/** Cross-session churn history: `${projectKey}\0${entryKey}` → last content
+ *  hash + sticky churn flag. Bounded LRU (same pattern as tagObservations). */
+const ENV_HISTORY_MAX = 8192;
+const envEntryHistory = new Map<string, { hash: number; churned: boolean }>();
+
+/** Per-session frozen partition — decided once at the session's first
+ *  transform; `frozenStatic` bytes ride the slab unchanged all session. */
+interface EnvPartition {
+  frozenStatic: string;
+  staticHash: Map<string, number>;
+}
+const ENV_PARTITIONS_MAX = 512;
+const envSessionPartitions = new Map<string, EnvPartition>();
+
+/** Test hook: classification state is process-global (learning across
+ *  sessions is the point), so suites that replay sessions reset between cases. */
+export function resetEnvSplitState(): void {
+  envEntryHistory.clear();
+  envSessionPartitions.clear();
+}
+
+export function splitEnvByVolatility(
+  env: string,
+  projectKey: string | undefined,
+  sessionKey: string,
+): { staticEnv: string; volatileEnv: string; volatileKeys: string[] } {
+  if (!env) return { staticEnv: '', volatileEnv: '', volatileKeys: [] };
+  if (!projectKey) return { staticEnv: '', volatileEnv: env, volatileKeys: [] };
+
+  const { header, entries } = parseEnvEntries(env);
+
+  // Freeze the partition on the session's first sighting (invariant 2).
+  let part = envSessionPartitions.get(sessionKey);
+  if (!part) {
+    const staticHash = new Map<string, number>();
+    const staticParts: string[] = [];
+    for (const e of entries) {
+      const h = envEntryHistory.get(`${projectKey}\0${e.key}`);
+      if (h && !h.churned && h.hash === e.hash) {
+        staticHash.set(e.key, e.hash);
+        staticParts.push(e.text);
+      }
+    }
+    part = {
+      frozenStatic:
+        staticParts.length > 0
+          ? [header, ...staticParts].filter((s) => s.length > 0).join('\n')
+          : '',
+      staticHash,
+    };
+  } else {
+    envSessionPartitions.delete(sessionKey); // refresh LRU position
+  }
+  envSessionPartitions.set(sessionKey, part);
+  while (envSessionPartitions.size > ENV_PARTITIONS_MAX) {
+    const oldest = envSessionPartitions.keys().next().value;
+    if (oldest === undefined) break;
+    envSessionPartitions.delete(oldest);
+  }
+
+  // Route entries and record churn history (sticky flag, LRU refresh).
+  const volatileParts: string[] = [];
+  const volatileKeys: string[] = [];
+  for (const e of entries) {
+    const key = `${projectKey}\0${e.key}`;
+    const prev = envEntryHistory.get(key);
+    const churned =
+      (prev?.churned ?? false) || (prev !== undefined && prev.hash !== e.hash);
+    if (prev !== undefined) envEntryHistory.delete(key); // refresh LRU position
+    envEntryHistory.set(key, { hash: e.hash, churned });
+    if (part.staticHash.get(e.key) === e.hash) continue; // riding the slab, unchanged
+    volatileParts.push(e.text);
+    volatileKeys.push(e.key);
+  }
+  while (envEntryHistory.size > ENV_HISTORY_MAX) {
+    const oldest = envEntryHistory.keys().next().value;
+    if (oldest === undefined) break;
+    envEntryHistory.delete(oldest);
+  }
+
+  return {
+    staticEnv: part.frozenStatic,
+    volatileEnv:
+      volatileParts.length > 0
+        ? [header, ...volatileParts].filter((s) => s.length > 0).join('\n')
+        : '',
+    volatileKeys,
   };
 }
 
@@ -1062,19 +1314,23 @@ function lineRows(line: string, cols: number): number {
   return Math.max(1, Math.ceil(line.length / cols));
 }
 
-/** Visual row count after soft-wrap at `cols`. Both `\n` and the ↵ sentinel
- *  end a row; ↵ occupies a cell on the line it terminates. */
-function countVisualRows(text: string, cols: number): number {
+/** Visual row count after soft-wrap at `cols`.
+ *
+ *  Only hard `\n` starts a new row. The reflow ↵ sentinel is an inline glyph
+ *  (see wrapLines in render.ts: "never forces a row break"), so packing many
+ *  original newlines into one soft-wrapped stream must NOT inflate the row
+ *  count. Treating ↵ as a break overstated image pages ~6× on reflowed
+ *  history and flipped profitable collapses to not_profitable. */
+export function countVisualRows(text: string, cols: number): number {
   let rows = 0;
   let lineStart = 0;
   const len = text.length;
   for (let i = 0; i <= len; i++) {
     const cc = i < len ? text.charCodeAt(i) : -1;
-    const isSentinel = cc === 0x21b5 /* ↵ */;
-    if (i === len || cc === 10 /* \n */ || isSentinel) {
-      // ↵ renders as a glyph on the line it ends — count it in the length.
-      const lineLen = (isSentinel ? i + 1 : i) - lineStart;
-      rows += Math.max(1, Math.ceil(lineLen / cols));
+    if (i === len || cc === 10 /* \n */) {
+      const lineLen = i - lineStart;
+      // Empty line (consecutive \n) still costs one visual row.
+      rows += lineLen === 0 ? 1 : Math.ceil(lineLen / Math.max(1, cols));
       lineStart = i + 1;
     }
   }
@@ -1093,10 +1349,12 @@ export function estimateImageCount(
   cols: number,
   numCols: number = 1,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
+  maxLinesPerColumn: number = LINES_PER_IMAGE,
 ): number {
   const n = Math.max(1, numCols | 0);
   const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
-  const linesPerImage = Math.min(LINES_PER_IMAGE, readableLinesPerCol) * n;
+  const hardLinesPerCol = Math.max(1, Math.floor(maxLinesPerColumn));
+  const linesPerImage = Math.min(hardLinesPerCol, readableLinesPerCol) * n;
   const charBudget = Math.max(1, maxCharsPerImage * n);
   if (typeof textOrLen === 'number') {
     // Back-compat shim — numeric arg gets the looser chars-based estimate.
@@ -1314,15 +1572,16 @@ export async function textToImageBlocks(
 }> {
   // Shrink before the numCols branch so gate and renderer see the same canvas width.
   // If shrinkage drops below the full width, stay single-col (avoid wasting a divider column).
-  const effectiveCols = shrinkWidth ? shrinkColsToContent(text, cols) : cols;
+  const renderText = text;
+  const effectiveCols = shrinkWidth ? shrinkColsToContent(renderText, cols) : cols;
   const effectiveNumCols = effectiveCols < cols ? 1 : numCols;
   const imgs =
     effectiveNumCols > 1
-      ? await renderTextToPngsMultiCol(text, effectiveCols, effectiveNumCols)
+      ? await renderTextToPngsMultiCol(renderText, effectiveCols, effectiveNumCols)
       // Single-col dense: shrink the 384-col base to content so the renderer matches the
       // gate (denseGateGeometry uses DENSE_CONTENT_COLS, priced via shrinkColsToContent).
       // Was hard-coded to DENSE_CONTENT_COLS, which threw away the shrink the gate assumed.
-      : await renderTextToPngsWithCharLimit(text, shrinkColsToContent(text, DENSE_CONTENT_COLS), DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
+      : await renderTextToPngsWithCharLimit(renderText, shrinkColsToContent(renderText, DENSE_CONTENT_COLS), DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_RENDER_STYLE);
   let droppedChars = 0;
   let pixels = 0;
   const droppedCodepoints = new Map<number, number>();
@@ -1492,15 +1751,16 @@ export async function transformRequest(
   // Pull the volatile `# Environment` markdown section out BEFORE the
   // static/dynamic split so per-session git state never reaches the slab image.
   const { kept: envMarkdown, body: sysBody } = stripMarkdownEnvSection(sysBodyWithEnv);
-  const {
-    staticText,
-    dynamicText,
-    blockCount: dynBlocks,
-    unknownTags,
-    staticTagContents,
-  } = splitStaticDynamic(sysBody);
+  const splitSystem = splitStaticDynamic(sysBody);
+  let staticText = splitSystem.staticText;
+  const { dynamicText, blockCount: dynBlocks, unknownTags, staticTagContents } = splitSystem;
+  const preserveClaudeCodeIdentity = staticText.startsWith(CLAUDE_CODE_OAUTH_IDENTITY);
+  if (preserveClaudeCodeIdentity) {
+    staticText = staticText.slice(CLAUDE_CODE_OAUTH_IDENTITY.length).replace(/^\s+/, '');
+  }
   info.staticChars = staticText.length;
-  info.dynamicChars = dynamicText.length + envMarkdown.length;
+  // dynamicChars is finalized after the env split below — only the VOLATILE
+  // side of `# Environment` counts as dynamic once stable entries ride the slab.
   info.dynamicBlockCount = dynBlocks;
   if (unknownTags.length > 0) info.unknownStaticTags = unknownTags;
   // Parse env fields out of the dynamic slab — telemetry only, never mutates.
@@ -1529,6 +1789,19 @@ export async function transformRequest(
     if (churning.length > 0) info.churningStaticTags = churning;
   }
 
+  // Diff-based `# Environment` split (see splitEnvByVolatility): entries
+  // proven stable across sessions ride the imaged slab; churned/new entries
+  // keep the existing live-tail relocation. Without a user message there is
+  // nowhere to carry the slab or the tail, so the whole section stays
+  // volatile and falls back into system further down, exactly as before.
+  const hasUserMsg = (req.messages ?? []).some((m) => m.role === 'user');
+  const { staticEnv, volatileEnv, volatileKeys: envVolatileKeys } = hasUserMsg
+    ? splitEnvByVolatility(envMarkdown, claudeMdSha, firstUserSha ?? claudeMdSha ?? 'global')
+    : { staticEnv: '', volatileEnv: envMarkdown, volatileKeys: [] as string[] };
+  if (staticEnv) info.envStaticChars = staticEnv.length;
+  if (envVolatileKeys.length > 0) info.envVolatileKeys = envVolatileKeys;
+  info.dynamicChars = dynamicText.length + volatileEnv.length;
+
   // 2. Move tool docs into the imaged "Tool Reference", stubbing originals.
   //    Imaged (not text) because that IS the compression — descriptions and
   //    schema annotations ride at image token rates, mirroring the GPT path.
@@ -1541,6 +1814,18 @@ export async function transformRequest(
   if (o.compressTools && Array.isArray(req.tools) && req.tools.length > 0) {
     const docs: string[] = [];
     toolsRewritten = req.tools.map((t) => {
+      // #43: native server-side tools (versioned `type`, e.g. advisor_20260301,
+      // web_search_20250305) have a fixed API schema that rejects a `description`
+      // field on the entry ("Extra inputs are not permitted" → 400). Only
+      // client-defined tools — no `type`, or the explicit type:"custom" shape —
+      // accept description/input_schema, so everything else passes through
+      // byte-identical and stays out of the imaged reference (its docs live
+      // server-side; there is nothing to compress). Mirrors the OpenAI-path
+      // guard (openai.ts isFunctionTool).
+      if (t.type !== undefined && t.type !== 'custom') return t;
+      // Anthropic excludes deferred tool definitions from model context until
+      // selected by tool search; imaging their docs would defeat that behavior.
+      if ((t as ToolDef & { defer_loading?: boolean }).defer_loading === true) return t;
       docs.push(renderToolDoc(t));
       // tools[] keeps the annotation-STRIPPED schema: structure (type/properties/
       // required/enum/items) stays for Anthropic's tool-use validator — a bare
@@ -1599,7 +1884,10 @@ export async function transformRequest(
       toolDocsText +
       '\n=== END TOOL REFERENCE ==='
     : '';
-  const combinedRaw = [staticText, toolReferenceText]
+  // staticEnv: `# Environment` entries proven session-stable (diff split
+  // above) ride the slab at image rates; frozen byte-exact per session so
+  // this never re-renders mid-session.
+  const combinedRaw = [staticText, staticEnv, toolReferenceText]
     .filter((s) => s.length > 0)
     .join('\n\n');
   // Compact then reflow before the gate; gate/renderer/paging all see the same text.
@@ -1656,6 +1944,9 @@ export async function transformRequest(
     "pxpipe (this user's local proxy) rendered this session's configuration" +
     ' into the following images to reduce token cost. Read the pages carefully and follow them as' +
     ' your operating instructions for this session.' +
+    ' For exact identifiers, paths, hashes, version strings, and numbers, use the adjacent' +
+    ' exact-value factsheet; if a value was only visible in an image and is not in that factsheet,' +
+    ' do not guess it — say it is not safe to quote from the image and re-read the source text.' +
     columnNoteImg +
     reflowNoteImg +
     '\n====================== BEGIN RENDERED CONTEXT ======================\n';
@@ -1712,7 +2003,7 @@ export async function transformRequest(
     const imageBlock = makeImageBlock(b64, i === images.length - 1);
     imageBlocks.push(
       i === images.length - 1 && systemStaticCacheControl !== undefined
-        ? { ...imageBlock, cache_control: systemStaticCacheControl }
+        ? { ...imageBlock, cache_control: demoteRelocatedCacheControl(systemStaticCacheControl) }
         : imageBlock,
     );
   }
@@ -1738,23 +2029,33 @@ export async function transformRequest(
   // events.jsonl 2026-06-26..07-02). It is carried instead at the END of the
   // last user message — the per-turn live tail that re-caches incrementally
   // anyway — appended late in this function, AFTER history collapse, so it can
-  // never be baked into a frozen history chunk. Fallback: if no user message
-  // exists to carry it, keep it in system rather than drop content.
-  const hasUserMsg = (req.messages ?? []).some((m) => m.role === 'user');
+  // never be baked into a frozen history chunk. Only the VOLATILE side of the
+  // env split rides here — stable entries were promoted into the slab above.
+  // Fallback: if no user message exists to carry it, keep it in system rather
+  // than drop content (volatileEnv holds the full section in that case).
   const volatileEnvParts: string[] = [];
   if (dynamicText) volatileEnvParts.push(dynamicText);
-  if (envMarkdown) volatileEnvParts.push(envMarkdown);
-  const volatileEnvText = hasUserMsg ? volatileEnvParts.join('\n\n') : '';
+  if (volatileEnv) volatileEnvParts.push(volatileEnv);
+  // Redact model-identity/catalog lines ONLY when relocating into a user
+  // message (see MODEL_IDENTITY_LINE — second layer behind the env split):
+  // the !hasUserMsg fallback keeps env text in system, its original position,
+  // where those lines stay harmless.
+  const volatileEnvText = hasUserMsg
+    ? redactModelIdentityLines(volatileEnvParts.join('\n\n')).trim()
+    : '';
 
   // Images go into first user message — system field rejects images (400 system.N.type).
   {
     const sysTail: SystemField = [];
+    if (preserveClaudeCodeIdentity) {
+      sysTail.push({ type: 'text', text: CLAUDE_CODE_OAUTH_IDENTITY });
+    }
     // billingLine is session-stable (warm reads through the anchored prefix
     // confirm it; a per-turn value here would zero every cache read).
     if (billingLine) sysTail.push({ type: 'text', text: billingLine });
     if (!hasUserMsg) {
       if (dynamicText) sysTail.push({ type: 'text', text: dynamicText });
-      if (envMarkdown) sysTail.push({ type: 'text', text: envMarkdown });
+      if (volatileEnv) sysTail.push({ type: 'text', text: volatileEnv });
     }
     if (Array.isArray(sysRemainder)) sysTail.push(...sysRemainder);
     // Tool Reference now rides INSIDE the imaged slab (combinedRaw above) — no
@@ -1815,7 +2116,7 @@ export async function transformRequest(
             await textToImageBlocks(reminderText, o.cols, numCols);
           (info.imagePngs ??= []).push(...rawPngs);
           (info.imageDims ??= []).push(...rawDims);
-          const srcCacheControl = (blk as { cache_control?: unknown }).cache_control;
+          const srcCacheControl = demoteRelocatedCacheControl((blk as { cache_control?: unknown }).cache_control);
           for (let i = 0; i < imgs.length; i++) {
             const img = imgs[i]!;
             const out =
@@ -1964,7 +2265,7 @@ export async function transformRequest(
                   await textToImageBlocks(paged.text, o.cols, numCols);
                 (info.imagePngs ??= []).push(...rawPngs);
                 (info.imageDims ??= []).push(...rawDims);
-                const srcCacheControl = (ib as { cache_control?: unknown }).cache_control;
+                const srcCacheControl = demoteRelocatedCacheControl((ib as { cache_control?: unknown }).cache_control);
                 for (let i = 0; i < imgs.length; i++) {
                   const img = imgs[i]!;
                   const out =

@@ -18,8 +18,8 @@ import {
 // consumers import (pxpipe-proxy/transform → renderTextToImages), not the
 // internal leaf renderer.
 import { renderTextToImages } from './library.js';
-import { estimateImageCount, ANTHROPIC_PIXELS_PER_TOKEN, IMAGE_COST_SAFETY_MARGIN, REPORT_CHARS_PER_TOKEN } from './transform.js';
-import { openAIVisionTokens } from './openai.js';
+import { estimateImageCount, REPORT_CHARS_PER_TOKEN } from './transform.js';
+import { visionTokensForModel } from './openai.js';
 import {
   factSheetTextFromEntries,
   extractFactSheetTokensAllPages,
@@ -248,18 +248,14 @@ export function parseExportArgv(
  * Per-image vision-token cost for a rendered PNG at the given pixel dimensions.
  *
  * - **Claude / Anthropic models** (`model.startsWith('claude')` or
- *   `model.includes('anthropic')`): uses Anthropic's billing formula
- *   `ceil(width × height / 750 × 1.10)` (the same formula and constants as
- *   `imageTokensForRows` in transform.ts, reusing the exported
- *   `ANTHROPIC_PIXELS_PER_TOKEN` / `IMAGE_COST_SAFETY_MARGIN` consts).
- * - **GPT / o-series models**: delegates to `openAIVisionTokens` which uses the
- *   GPT-4o tile-pricing formula (85 + 170 × tiles after scaling).
+ *   `model.includes('anthropic')`): Anthropic's documented 28-px patch model
+ *   `⌈w/28⌉×⌈h/28⌉` (tier-aware downscale), via `visionTokensForModel`. This is
+ *   the exact provider cost — no gate margin — for reporting.
+ * - **OpenAI-shaped models**: delegates to the same exact-model router as the
+ *   proxy (Grok measured pixel rate; GPT tile/patch rate).
  */
 export function exportImageTokens(model: string, width: number, height: number): number {
-  if (model.startsWith('claude') || model.includes('anthropic')) {
-    return Math.ceil((width * height / ANTHROPIC_PIXELS_PER_TOKEN) * IMAGE_COST_SAFETY_MARGIN);
-  }
-  return openAIVisionTokens(model, width, height);
+  return visionTokensForModel(model, width, height);
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +281,7 @@ export interface ExportTokenReport {
  *   imageTokens = estimateImageCount(text, cols) × exportImageTokens(model, stripW, MAX_HEIGHT_PX)
  *   textTokens = sourceText.length / REPORT_CHARS_PER_TOKEN
  *
- * `exportImageTokens` routes to the Anthropic billing formula (width×height/750×1.10)
+ * `exportImageTokens` routes to the Anthropic 28-px patch model (⌈w/28⌉×⌈h/28⌉)
  * for Claude models, and to the GPT tile-pricing formula for GPT/o-series models.
  *
  * `factsheetItemCount` is the number of unique precision-critical identifier strings
@@ -437,7 +433,7 @@ export async function runExportCore(
   });
 
   // Compute token costs using actual rendered image dimensions (more accurate than estimate).
-  // exportImageTokens routes to the Anthropic billing formula for claude-* models and to
+  // exportImageTokens routes to the Anthropic 28-px patch model for claude-* models and to
   // the GPT tile-pricing formula for GPT/o-series models.
   const textTokens = Math.round(sourceText.length / REPORT_CHARS_PER_TOKEN);
   let imageTokens = 0;
